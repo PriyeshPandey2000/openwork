@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -30,6 +30,7 @@ const apiErrorSchema = z.object({
 const connectStateResponseSchema = z.object({
   ok: z.literal(true),
   schemaVersion: z.literal(1),
+  status: z.enum(["available", "missing", "invalid", "unreadable"]),
   connectEnabled: z.boolean(),
   cloudMcpPresent: z.boolean(),
   googleWorkspace: z.object({ legacyConfigured: z.boolean() }),
@@ -111,7 +112,7 @@ async function boot() {
   const config = serverConfig(root);
   const server = await startServer(config);
   stops.push(() => server.stop());
-  return { base: `http://127.0.0.1:${server.port}`, config };
+  return { base: `http://127.0.0.1:${server.port}`, config, root };
 }
 
 function clientHeaders() {
@@ -226,11 +227,8 @@ describe("Connect-aware legacy extension gating", () => {
 
     expectAllActions(await listActions(base));
     await expectLegacyCallPassesThrough(base);
-    const status = await readSchema(
-      await fetch(`${base}/experimental/google-workspace/status`, { headers: clientHeaders() }),
-      googleWorkspaceStatusSchema,
-    );
-    expect(status.connect).toBeUndefined();
+    const statusAction = await readSchema(await callGoogleWorkspaceStatus(base), googleWorkspaceStatusActionSchema);
+    expect(statusAction.result.connect).toBeUndefined();
   });
 
   test("keeps legacy extension behavior unchanged when legacy Google Workspace is configured", async () => {
@@ -241,11 +239,8 @@ describe("Connect-aware legacy extension gating", () => {
 
     expectAllActions(await listActions(base));
     await expectLegacyCallPassesThrough(base);
-    const status = await readSchema(
-      await fetch(`${base}/experimental/google-workspace/status`, { headers: clientHeaders() }),
-      googleWorkspaceStatusSchema,
-    );
-    expect(status.connect).toBeUndefined();
+    const statusAction = await readSchema(await callGoogleWorkspaceStatus(base), googleWorkspaceStatusActionSchema);
+    expect(statusAction.result.connect).toBeUndefined();
     const state = await readSchema(
       await fetch(`${base}/experimental/connect/state`, { headers: clientHeaders() }),
       connectStateResponseSchema,
@@ -273,18 +268,12 @@ describe("Connect-aware legacy extension gating", () => {
     expect(gatedBody.message).toContain("Settings > Connect");
     expect(gatedBody.message).toContain("Do not direct them to Settings > Extensions");
 
-    const status = await readSchema(
-      await fetch(`${base}/experimental/google-workspace/status`, { headers: clientHeaders() }),
-      googleWorkspaceStatusSchema,
-    );
-    expect(status.connect).toEqual({
+    const statusAction = await readSchema(await callGoogleWorkspaceStatus(base), googleWorkspaceStatusActionSchema);
+    expect(statusAction.result.connect).toEqual({
       enabled: true,
       cloudMcpPresent: false,
       guidance: gatedBody.message,
     });
-
-    const statusAction = await readSchema(await callGoogleWorkspaceStatus(base), googleWorkspaceStatusActionSchema);
-    expect(statusAction.result.connect).toEqual(status.connect);
 
     await writeRuntimeOpencodeConfig(config, "ws_1", (current) => ({
       ...current,
@@ -301,11 +290,8 @@ describe("Connect-aware legacy extension gating", () => {
     expect(cloudBody.message).not.toContain("Repair and test");
     expect(cloudBody.message).toContain("Settings > Connect");
 
-    const cloudStatus = await readSchema(
-      await fetch(`${base}/experimental/google-workspace/status`, { headers: clientHeaders() }),
-      googleWorkspaceStatusSchema,
-    );
-    expect(cloudStatus.connect).toEqual({
+    const cloudStatusAction = await readSchema(await callGoogleWorkspaceStatus(base), googleWorkspaceStatusActionSchema);
+    expect(cloudStatusAction.result.connect).toEqual({
       enabled: true,
       cloudMcpPresent: false,
       guidance: cloudBody.message,
@@ -313,7 +299,30 @@ describe("Connect-aware legacy extension gating", () => {
   });
 
   test("validates and round-trips the persisted connect state route", async () => {
-    const { base } = await boot();
+    const { base, root } = await boot();
+    const initialState = await readSchema(
+      await fetch(`${base}/experimental/connect/state`, { headers: clientHeaders() }),
+      connectStateResponseSchema,
+    );
+    expect(initialState).toMatchObject({ status: "missing", connectEnabled: false });
+
+    const statePath = join(root, "connect-state.json");
+    await writeFile(statePath, "{not valid json", "utf8");
+    const invalidState = await readSchema(
+      await fetch(`${base}/experimental/connect/state`, { headers: clientHeaders() }),
+      connectStateResponseSchema,
+    );
+    expect(invalidState).toMatchObject({ status: "invalid", connectEnabled: false });
+
+    await rm(statePath);
+    await mkdir(statePath);
+    const unreadableState = await readSchema(
+      await fetch(`${base}/experimental/connect/state`, { headers: clientHeaders() }),
+      connectStateResponseSchema,
+    );
+    expect(unreadableState).toMatchObject({ status: "unreadable", connectEnabled: false });
+    await rm(statePath, { recursive: true });
+
     const badType = await putConnectState(base, { connectEnabled: "true" });
     expect(badType.status).toBe(400);
     expect((await readSchema(badType, apiErrorSchema)).code).toBe("invalid_payload");
@@ -324,6 +333,7 @@ describe("Connect-aware legacy extension gating", () => {
     const put = await putConnectState(base, { connectEnabled: true });
     expect(put.status).toBe(200);
     const putState = await readSchema(put, connectStateResponseSchema);
+    expect(putState.status).toBe("available");
     expect(putState.connectEnabled).toBe(true);
     expect(putState.cloudMcpPresent).toBe(false);
     expect(putState.googleWorkspace.legacyConfigured).toBe(false);
@@ -331,6 +341,7 @@ describe("Connect-aware legacy extension gating", () => {
     const get = await fetch(`${base}/experimental/connect/state`, { headers: clientHeaders() });
     expect(get.status).toBe(200);
     const getState = await readSchema(get, connectStateResponseSchema);
+    expect(getState.status).toBe("available");
     expect(getState.connectEnabled).toBe(putState.connectEnabled);
     expect(getState.cloudMcpPresent).toBe(putState.cloudMcpPresent);
     expect(getState.googleWorkspace).toEqual(putState.googleWorkspace);

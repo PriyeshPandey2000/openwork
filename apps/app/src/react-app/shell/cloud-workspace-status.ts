@@ -1,4 +1,13 @@
-import type { DenCloudInstance } from "@/app/lib/den";
+import type { DenCloudInstance, DenCloudStartupFailure } from "@/app/lib/den";
+
+export function cloudWorkspaceFailureLogFields(failure: DenCloudStartupFailure) {
+  return {
+    failure_code: failure.code,
+    failure_stage: failure.stage,
+    failure_reference: failure.reference,
+    failure_occurred_at: failure.occurredAt,
+  };
+}
 
 export type CloudWorkspacePillVariant =
   | "ready"
@@ -6,6 +15,7 @@ export type CloudWorkspacePillVariant =
   | "waking"
   | "provisioning"
   | "updating"
+  | "unavailable"
   | "failed";
 
 export type CloudWorkspaceViewModel = {
@@ -92,10 +102,16 @@ export function cloudWorkspaceTakeoverCopy(input: {
       body: "We couldn’t start the sandbox. Retry, or sign out and reconnect.",
     };
   }
+  if (input.variant === "unavailable") {
+    return {
+      title: "Couldn’t check your workspace",
+      body: "OpenWork Cloud didn’t answer. Your sandbox may still be running, so try checking again.",
+    };
+  }
   if (input.slow) {
     return {
       title: "Still working on it…",
-      body: "This is taking longer than usual. Nothing is broken — wait it out, or retry.",
+      body: "This is taking longer than usual. You can keep waiting or check again.",
     };
   }
   if (input.variant === "provisioning") {
@@ -130,8 +146,57 @@ export function cloudWorkspaceUpdateAvailable(instance: DenCloudInstance | null)
   return instance.imageVersion === null || instance.imageVersion !== instance.latestVersion;
 }
 
+// Stopped instances already recycle on wake; this only nudges running stale instances,
+// skips while any client-visible run is active, and attempts once per target version so
+// failed or already_current attempts cannot retry-loop.
+export function shouldAutoUpdateCloudWorkspace(input: {
+  gatewayMode: boolean;
+  visible: boolean;
+  status: "provisioning" | "waking" | "ready" | "failed" | null;
+  updateAvailable: boolean;
+  updating: boolean;
+  requestFailed: boolean;
+  hasActiveRun: boolean;
+  latestVersion: string | null;
+  lastAttemptedVersion: string | null;
+}): boolean {
+  return input.gatewayMode
+    && input.visible
+    && input.status === "ready"
+    && input.updateAvailable
+    && !input.updating
+    && !input.requestFailed
+    && !input.hasActiveRun
+    && input.latestVersion !== null
+    && input.latestVersion !== input.lastAttemptedVersion;
+}
+
 export function cloudWorkspaceStatusHasReadyContent(variant: CloudWorkspacePillVariant): boolean {
   return variant === "ready" || variant === "stale";
+}
+
+/**
+ * Gateway boot is owned by the workspace takeover. Showing the generic overlay
+ * at the same time stacks two wait indicators on first load.
+ */
+export function shouldSuppressBootOverlayForGateway(input: {
+  gatewayMode: boolean;
+  signedIn: boolean;
+  variant: CloudWorkspacePillVariant;
+}): boolean {
+  return input.gatewayMode && input.signedIn && !cloudWorkspaceStatusHasReadyContent(input.variant);
+}
+
+export function shouldShowCloudWorkspaceStatusPill(input: {
+  variant: CloudWorkspacePillVariant;
+  hasInstance: boolean;
+  requestFailed: boolean;
+}): boolean {
+  if (!input.hasInstance && !input.requestFailed) return false;
+  return input.variant === "waking"
+    || input.variant === "provisioning"
+    || input.variant === "unavailable"
+    || input.variant === "failed";
 }
 
 export function mapCloudWorkspaceMainContentDecision(input: {
@@ -193,7 +258,21 @@ export function mapCloudWorkspaceState(input: {
   const updateAvailable = cloudWorkspaceUpdateAvailable(input.instance);
   const lines = baseLines(input.instance, updateAvailable);
 
-  if (input.requestFailed || input.instance?.status === "failed") {
+  if (input.requestFailed) {
+    return {
+      variant: "unavailable",
+      label: "Couldn’t check workspace",
+      tone: "amber",
+      statusLine: "Couldn’t check workspace status",
+      ...lines,
+      updateAvailable,
+      showUpdate: false,
+      showRetry: true,
+      pollMs: 5_000,
+    };
+  }
+
+  if (input.instance?.status === "failed") {
     return {
       variant: "failed",
       label: "Workspace needs attention",

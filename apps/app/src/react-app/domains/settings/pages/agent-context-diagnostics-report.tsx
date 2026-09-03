@@ -15,6 +15,7 @@ import type {
 import { Button } from "@/components/ui/button";
 import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
+import { resolveOpenWorkConnectStateSummary } from "@/react-app/domains/connections/openwork-connect-status";
 import { SettingsInset, SettingsNotice, SettingsSection } from "../settings-section";
 
 const EXPECTED_CLOUD_TOOL_IDS = ["search_capabilities", "execute_capability"];
@@ -365,7 +366,7 @@ function AgentEvidence(props: {
       <div className="flex flex-wrap gap-2">
         <Marker label="search_capabilities" value={agent.prompt.markers.searchCapabilities} />
         <Marker label="execute_capability" value={agent.prompt.markers.executeCapability} />
-        <Marker label={t("connect.diagnostics_memory_marker")} value={agent.prompt.markers.memoryBank} />
+        <Marker label={t("connect.diagnostics_artifacts_marker")} value={agent.prompt.markers.artifacts} />
       </div>
       <div className="space-y-1.5">
         <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-dls-secondary">
@@ -592,6 +593,10 @@ export function AgentContextDiagnosticsReportView(props: {
   const firstFailure = props.report.firstFailedCheck;
   const agent = props.report.agent.configuredOpenworkAgent;
   const effectiveEngineObserved = hasObservedEffectiveEngineConfiguration(props.report);
+  const connectStateSummary = resolveOpenWorkConnectStateSummary(
+    props.report.connect.stateStatus,
+    props.report.connect.connectEnabled,
+  );
   return (
     <SettingsSection>
       <div data-testid="agent-diagnostics-report">
@@ -663,7 +668,7 @@ export function AgentContextDiagnosticsReportView(props: {
               label={t("connect.diagnostics_expected_branch")}
               value={t(BRANCH_LABEL_KEYS[props.report.connect.expectedBranch])}
             />
-            <Fact label={t("connect.diagnostics_connect_enabled")} value={booleanLabel(props.report.connect.connectEnabled)} />
+            <Fact label={t("connect.diagnostics_connect_policy")} value={connectStateSummary.statusLabel} />
             <Fact
               label={t("connect.diagnostics_legacy_google_workspace")}
               value={booleanLabel(props.report.connect.legacyGoogleWorkspaceConfigured)}
@@ -676,6 +681,12 @@ export function AgentContextDiagnosticsReportView(props: {
               value={t(AGENT_STATE_LABEL_KEYS[agent.state])}
             />
           </div>
+          {connectStateSummary.status !== "ready" ? (
+            <SettingsNotice tone={connectStateSummary.tone === "error" ? "error" : "neutral"}>
+              <div className="font-medium text-dls-text">{connectStateSummary.stageLabel}</div>
+              <div>{connectStateSummary.recommendedAction}</div>
+            </SettingsNotice>
+          ) : null}
         </div>
 
         <McpInventory report={props.report} effectiveEngineObserved={effectiveEngineObserved} />

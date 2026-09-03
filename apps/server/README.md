@@ -99,8 +99,6 @@ Sandbox advertisement (for capability discovery):
 - `DELETE /workspace/:id/commands/:name`
 - `GET /workspace/:id/audit`
 - `GET /workspace/:id/export`
-- `POST /workspace/:id/import/preview`
-- `POST /workspace/:id/import`
 
 Token management (host/owner auth):
 
@@ -114,19 +112,9 @@ Inbox/outbox:
 - `GET /workspace/:id/artifacts`
 - `GET /workspace/:id/artifacts/:artifactId`
 - `POST /workspace/:id/files/sessions`
-- `POST /files/sessions/:sessionId/renew`
 - `DELETE /files/sessions/:sessionId`
 - `GET /files/sessions/:sessionId/catalog/snapshot`
-- `GET /files/sessions/:sessionId/catalog/events`
-- `POST /files/sessions/:sessionId/read-batch`
-- `POST /files/sessions/:sessionId/write-batch`
 - `POST /files/sessions/:sessionId/ops`
-
-Toy UI (static assets served by the server):
-
-- `GET /ui`
-- `GET /w/:id/ui`
-- `GET /ui/assets/*`
 
 OpenCode proxy:
 

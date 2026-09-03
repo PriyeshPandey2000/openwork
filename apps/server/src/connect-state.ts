@@ -13,6 +13,7 @@ import { googleWorkspaceLegacyConfigured } from "./extensions/google-workspace.j
 import { readBoundedRegularTextFile } from "./jsonc.js";
 import { runtimeStorageDir } from "./runtime-db.js";
 import {
+  ENGINE_GLOBAL_RUNTIME_CONFIG_ID,
   inspectRuntimeOpencodeConfigState,
   runtimeMcpMap,
 } from "./runtime-opencode-config-store.js";
@@ -45,6 +46,7 @@ export type ConnectStateInspection = {
 };
 
 export type ConnectSnapshot = {
+  status: ConnectStateInspectionStatus;
   connectEnabled: boolean;
   connectCatalogEnabled: boolean;
   cloudMcpPresent: boolean;
@@ -196,7 +198,10 @@ export async function writeConnectCloudMcp(
 }
 
 function normalizeDirectory(directory: string): string {
-  return directory.trim().replace(/[\/]+$/, "");
+  const trimmed = directory.trim();
+  let end = trimmed.length;
+  while (end > 0 && trimmed[end - 1] === "/") end -= 1;
+  return end === trimmed.length ? trimmed : trimmed.slice(0, end);
 }
 
 function workspaceDirectory(workspace: WorkspaceInfo, resolveOpencodeDirectory?: (workspace: WorkspaceInfo) => string | null): string | null {
@@ -282,10 +287,12 @@ async function resolveCloudHealth(config: ServerConfig, options: ConnectSnapshot
 }
 
 export async function getConnectSnapshot(config: ServerConfig, options: ConnectSnapshotOptions = {}): Promise<ConnectSnapshot> {
-  const state = await readConnectState(config);
+  const stateInspection = await inspectConnectState(config);
+  const state = stateInspection.state;
   const { cloudHealth, workspace } = await resolveCloudHealth(config, options);
 
   return {
+    status: stateInspection.status,
     connectEnabled: state.connectEnabled,
     connectCatalogEnabled: state.connectEnabled,
     cloudMcpPresent: cloudHealth?.usable === true,
@@ -316,6 +323,7 @@ export async function inspectConnectSnapshot(
       ? stateInspection.status
       : "unreadable",
     snapshot: {
+      status: stateInspection.status,
       connectEnabled: stateInspection.state.connectEnabled,
       connectCatalogEnabled: stateInspection.state.connectEnabled,
       cloudMcpPresent: runtimeInspection.cloudMcpPresent,
@@ -335,8 +343,16 @@ async function inspectConnectRuntime(
   config: ServerConfig,
   options?: ConnectStateInspectionOptions,
 ): Promise<{ cloudMcpPresent: boolean; complete: boolean }> {
-  const serverCloudMcp = await readConnectCloudMcp(config);
-  if (serverCloudMcp) return { cloudMcpPresent: true, complete: true };
+  const globalInspection = await inspectRuntimeOpencodeConfigState(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, {
+    maxBytes: options?.runtimeConfigMaxBytes,
+    signal: options?.signal,
+  });
+  if (globalInspection.status === "unreadable" || globalInspection.status === "invalid-row") {
+    return { cloudMcpPresent: false, complete: false };
+  }
+  if (Object.hasOwn(runtimeMcpMap(globalInspection.config), OPENWORK_CLOUD_MCP_NAME)) {
+    return { cloudMcpPresent: true, complete: true };
+  }
 
   const configuredMaxRows = options?.maxRuntimeRows;
   const maxRuntimeRows = typeof configuredMaxRows === "number"

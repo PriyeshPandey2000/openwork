@@ -6,9 +6,10 @@ import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { OPENWORK_DOWNLOAD_URL } from "../../CONSTS.js"
+import { cache } from "../../cache.js"
 import { db } from "../../db.js"
 import { env } from "../../env.js"
-import { authenticatedRoute, jsonValidator, orgMemberRoute, type OrganizationContextVariables, type UserOrganizationsContext } from "../../middleware/index.js"
+import { authenticatedRoute, jsonValidator, orgMemberRoute, userSessionRoute, type OrganizationContextVariables, type UserOrganizationsContext } from "../../middleware/index.js"
 import { denTypeIdSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, unauthorizedSchema } from "../../openapi.js"
 import { normalizeOrganizationMetadata } from "../../organization-limits.js"
 import { resolveUserOrganizations, setSessionActiveOrganization, type UserOrgSummary } from "../../orgs.js"
@@ -289,6 +290,7 @@ export function registerMeRoutes<T extends { Variables: AuthContextVariables & P
         .update(AuthUserTable)
         .set({ name, updatedAt })
         .where(eq(AuthUserTable.id, normalizeDenTypeId("user", user.id)))
+      await cache.auth.deleteSessionsForUser(normalizeDenTypeId("user", user.id))
 
       return c.json({
         user: {
@@ -314,16 +316,12 @@ export function registerMeRoutes<T extends { Variables: AuthContextVariables & P
         403: jsonResponse("The caller cannot switch this kind of session.", forbiddenSchema),
       },
     }),
-    authenticatedRoute(),
+    userSessionRoute(),
     jsonValidator(setActiveOrganizationSchema),
     async (c) => {
       const user = c.get("user")
       const session = c.get("session")
       const input = c.req.valid("json")
-
-      if (c.get("apiKey") || !session?.id) {
-        return c.json({ error: "forbidden", message: "Active organization can only be updated for a user session." }, 403)
-      }
 
       const requestedOrgId = input.organizationId ?? null
       const resolved = await resolveUserOrganizations({
@@ -374,6 +372,8 @@ export function registerMeRoutes<T extends { Variables: AuthContextVariables & P
 
       return c.json({
         ...desktopPolicy,
+        automationsEnabled: env.automations.enabled,
+        dashboardEnabled: env.dashboardsEnabled,
         connectEnabled: memberFacingMcpConnectionsEnabled(organization.metadata, {
           gatingEnabled: env.mcpConnectionsGatingEnabled,
         }),

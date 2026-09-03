@@ -23,10 +23,11 @@ import { z } from "zod"
 import { db } from "../../db.js"
 import { ensureDefaultDesktopPolicyForOrganization } from "../../desktop-policies.js"
 import { env } from "../../env.js"
-import { jsonValidator, publicRoute, authenticatedRoute } from "../../middleware/index.js"
+import { jsonValidator, publicRoute, userSessionRoute } from "../../middleware/index.js"
 import { DEFAULT_ORGANIZATION_LIMITS } from "../../organization-limits.js"
 import { denTypeIdSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { seedDefaultOrganizationRoles, setSessionActiveOrganization } from "../../orgs.js"
+import { clampUtf8Bytes, PROJECTION_TEXT_MAX_BYTES } from "../org/plugin-system/projection-text.js"
 import type { AuthContextVariables } from "../../session.js"
 import {
   DEFAULT_OPENWORK_MARKETPLACE_DESCRIPTION,
@@ -270,7 +271,7 @@ export function registerBootstrapRoutes<T extends { Variables: AuthContextVariab
           sourceMode: "cloud",
           title: metadata.title,
           description: metadata.description,
-          searchText: [metadata.title, metadata.description, skillText].filter(Boolean).join("\n"),
+          searchText: clampUtf8Bytes([metadata.title, metadata.description, skillText].filter(Boolean).join("\n"), PROJECTION_TEXT_MAX_BYTES),
           currentFileName: null,
           currentFileExtension: null,
           currentRelativePath: null,
@@ -412,7 +413,7 @@ export function registerBootstrapRoutes<T extends { Variables: AuthContextVariab
         404: jsonResponse("The claim token was missing, expired, or already used.", notFoundSchema),
       },
     }),
-    authenticatedRoute(),
+    userSessionRoute(),
     jsonValidator(acceptClaimSchema),
     async (c) => {
       const user = c.get("user")

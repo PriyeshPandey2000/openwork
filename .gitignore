@@ -1,6 +1,7 @@
 .turbo/
 node_modules/
 apps/desktop/dist-electron/
+apps/desktop/.electron-runtime/
 apps/desktop/dist-electron-demo-a/
 apps/desktop/dist-electron-demo-b/
 packages/*/node_modules/
@@ -17,6 +18,8 @@ ee/apps/*/dist/
 ee/packages/*/dist/
 ee/apps/inference/models-site/models/api.json
 tmp/
+coverage/
+evals/results/flake/
 
 # Local git worktrees
 _worktrees/

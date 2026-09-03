@@ -15,18 +15,21 @@ import { db } from "../../db.js"
 import { checkEntitlement, getOrganizationEntitlements, parseOrganizationPlan } from "../../entitlements.js"
 import { env } from "../../env.js"
 import { findEnterpriseAuthRequirementForEmailDomain, resolveNonSsoSignInMethodForEmail } from "../../enterprise-auth-requirement.js"
-import { authenticatedRoute, jsonValidator, orgMemberRoute, orgRoleRoute, publicRoute, queryValidator, resolveMemberTeamsMiddleware } from "../../middleware/index.js"
+import { jsonValidator, orgMemberRoute, orgRoleRoute, publicRoute, queryValidator, resolveMemberTeamsMiddleware, userSessionRoute } from "../../middleware/index.js"
 import { denTypeIdSchema, enterprisePlanRequiredSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { validateInvitationAcceptVerification } from "../../organization-join-verification.js"
 import { normalizeOrganizationMetadata } from "../../organization-limits.js"
+import { isOpenWorkWebAvailableForOrganization } from "../../openwork-web-availability.js"
 import {
   acceptInvitationForUser,
   createOrganizationForUser,
+  getOrganizationContextForUser,
   getInvitationPreview,
   getSingletonSsoStatus,
   normalizeAllowedEmailDomains,
   OrganizationEmailDomainRestrictionError,
   serializeMemberFacingOrganizationMetadata,
+  seedDefaultOrganizationRoles,
   setSessionActiveOrganization,
   type AcceptInvitationForUserResult,
   updateOrganizationSettings,
@@ -34,7 +37,7 @@ import {
 import { getRequiredUserEmail } from "../../user.js"
 import { checkRateLimit } from "../../utils/rate-limit.js"
 import type { OrgRouteVariables } from "./shared.js"
-import { ensureOrganizationSuperAdmin, orgAccessFailureStatus } from "./shared.js"
+import { ensureOrganizationAdminRole, ensureOrganizationSuperAdmin, orgAccessFailureStatus } from "./shared.js"
 
 const createOrganizationSchema = z.object({
   name: z.string().trim().min(2).max(120),
@@ -55,6 +58,10 @@ const updateOrganizationSchema = z.object({
 
 const resolveSsoByEmailQuerySchema = z.object({
   email: z.string().trim().email(),
+})
+
+const organizationContextQuerySchema = z.object({
+  refreshRoles: z.enum(["true", "false"]).optional().transform((value) => value === "true"),
 })
 
 const resolveSsoByEmailResponseSchema = z.object({
@@ -78,6 +85,17 @@ const rateLimitedSchema = z.object({
   message: z.string(),
 }).meta({ ref: "RateLimitedError" })
 
+const SSO_RESOLVE_IDENTITY_RATE_LIMIT_MAX = 20
+const SSO_RESOLVE_RATE_LIMIT_WINDOW_MS = 60_000
+// See the login-options buckets: a long domain window buys burst tolerance for
+// a coworker sign-in wave while keeping SUSTAINED per-domain throughput below
+// the previous flat 20/min (120 per 10 min = 12/min; 30 misses per 10 min = 3/min).
+const SSO_RESOLVE_DOMAIN_RATE_LIMIT_WINDOW_MS = 600_000
+const SSO_RESOLVE_DOMAIN_RATE_LIMIT_MAX = 120
+const SSO_RESOLVE_DOMAIN_MISS_RATE_LIMIT_MAX = 30
+// A generous domain bucket bounds distributed enumeration without recreating coworker lockouts;
+// only unresolved addresses pay the tighter miss bucket.
+
 const singleOrgSsoStatusResponseSchema = z.object({
   configured: z.boolean(),
   organizationSlug: z.string(),
@@ -92,6 +110,11 @@ const invitationPreviewQuerySchema = z.object({
 const acceptInvitationSchema = z.object({
   id: z.string().trim().min(1).max(255),
 })
+
+const scimDeprovisionedSchema = z.object({
+  error: z.literal("scim_deprovisioned"),
+  message: z.string(),
+}).meta({ ref: "ScimDeprovisionedError" })
 
 const organizationResponseSchema = z.object({
   organization: z.object({}).passthrough().nullable(),
@@ -206,29 +229,32 @@ function normalizeResolveEmail(email: string) {
   return email.trim().toLowerCase()
 }
 
-function getResolveEmailDomain(email: string) {
-  const normalized = normalizeResolveEmail(email)
-  const atIndex = normalized.lastIndexOf("@")
-  return atIndex > 0 && atIndex < normalized.length - 1 ? normalized.slice(atIndex + 1) : "unknown"
+export function ssoResolveRateLimitKeys(headers: Headers, email: string) {
+  const normalizedEmail = normalizeResolveEmail(email)
+  const domainHash = sha256Hex(normalizedEmail.slice(normalizedEmail.lastIndexOf("@") + 1))
+  return {
+    ip: `org-sso-resolve:ip:${sha256Hex(getRequestAddress(headers))}`,
+    email: `org-sso-resolve:email:${sha256Hex(normalizedEmail)}`,
+    domain: `org-sso-resolve:domain:${domainHash}`,
+    domainMiss: `org-sso-resolve:domain-miss:${domainHash}`,
+  }
 }
 
-async function checkSsoResolveRateLimit(headers: Headers, email: string) {
-  const normalizedEmail = normalizeResolveEmail(email)
+async function checkSsoResolveRateLimit(keys: ReturnType<typeof ssoResolveRateLimitKeys>) {
   const now = Date.now()
-  const keys = [
-    `org-sso-resolve:ip:${sha256Hex(getRequestAddress(headers))}`,
-    `org-sso-resolve:email:${sha256Hex(normalizedEmail)}`,
-    `org-sso-resolve:domain:${sha256Hex(getResolveEmailDomain(normalizedEmail))}`,
-  ]
 
-  for (const key of keys) {
-    const retryAfter = await checkRateLimit(key, 20, 60_000, now)
+  for (const key of [keys.ip, keys.email]) {
+    const retryAfter = await checkRateLimit(key, SSO_RESOLVE_IDENTITY_RATE_LIMIT_MAX, SSO_RESOLVE_RATE_LIMIT_WINDOW_MS, now)
     if (retryAfter !== null) {
       return retryAfter
     }
   }
 
-  return null
+  return checkRateLimit(keys.domain, SSO_RESOLVE_DOMAIN_RATE_LIMIT_MAX, SSO_RESOLVE_DOMAIN_RATE_LIMIT_WINDOW_MS, now)
+}
+
+function checkSsoResolveMissRateLimit(key: string) {
+  return checkRateLimit(key, SSO_RESOLVE_DOMAIN_MISS_RATE_LIMIT_MAX, SSO_RESOLVE_DOMAIN_RATE_LIMIT_WINDOW_MS, Date.now())
 }
 
 async function setRequestActiveOrganization(
@@ -268,16 +294,9 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         409: jsonResponse("Organization creation is disabled in single-org mode.", singleOrgModeSchema),
       },
     }),
-    authenticatedRoute(),
+    userSessionRoute(),
     jsonValidator(createOrganizationSchema),
     async (c) => {
-    if (c.get("apiKey")) {
-      return c.json({
-        error: "forbidden",
-        message: "API keys cannot create organizations.",
-      }, 403)
-    }
-
     if (env.orgMode === "single_org") {
       return c.json({
         error: "single_org_mode",
@@ -342,21 +361,14 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         400: jsonResponse("The invitation acceptance request body was invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to accept an invitation.", unauthorizedSchema),
         403: jsonResponse("API keys cannot accept invitations, or the deployment requires a verified account email.", forbiddenSchema),
-        409: jsonResponse("The current account email is not allowed to join this organization.", accountEmailDomainNotAllowedSchema),
+        409: jsonResponse("The account cannot join this organization.", z.union([accountEmailDomainNotAllowedSchema, scimDeprovisionedSchema])),
         410: jsonResponse("The user previously accepted this invitation, but their workspace access was removed.", membershipRemovedSchema),
         404: jsonResponse("The invitation could not be found.", notFoundSchema),
       },
     }),
-    authenticatedRoute(),
+    userSessionRoute(),
     jsonValidator(acceptInvitationSchema),
     async (c) => {
-    if (c.get("apiKey")) {
-      return c.json({
-        error: "forbidden",
-        message: "API keys cannot accept organization invitations.",
-      }, 403)
-    }
-
     const user = c.get("user")
     const input = c.req.valid("json")
     const email = getRequiredUserEmail(user)
@@ -401,6 +413,12 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         error: "membership_removed",
         message: "Your access to this workspace was removed. Ask a workspace admin for a new invite.",
       }, 410)
+    }
+    if (accepted.status === "scim_deprovisioned") {
+      return c.json({
+        error: "scim_deprovisioned",
+        message: "This member is managed by your identity provider. Restore their access in the IdP.",
+      }, 409)
     }
 
     await setRequestActiveOrganization(c, accepted.member.organizationId)
@@ -563,7 +581,8 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         }, botProtection.status)
       }
 
-      const retryAfter = await checkSsoResolveRateLimit(c.req.raw.headers, query.email)
+      const rateLimitKeys = ssoResolveRateLimitKeys(c.req.raw.headers, query.email)
+      const retryAfter = await checkSsoResolveRateLimit(rateLimitKeys)
       if (retryAfter !== null) {
         c.header("Retry-After", String(retryAfter))
         return c.json({
@@ -584,9 +603,21 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         })
       }
 
+      const method = await resolveNonSsoSignInMethodForEmail(query.email)
+      if (method === "signup") {
+        const missRetryAfter = await checkSsoResolveMissRateLimit(rateLimitKeys.domainMiss)
+        if (missRetryAfter !== null) {
+          c.header("Retry-After", String(missRetryAfter))
+          return c.json({
+            error: "rate_limited",
+            message: "Too many sign-in resolution attempts. Try again later.",
+          }, 429)
+        }
+      }
+
       return c.json({
         requireSso: false,
-        method: await resolveNonSsoSignInMethodForEmail(query.email),
+        method,
       })
     },
   )
@@ -604,9 +635,31 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
       },
     }),
     orgMemberRoute(),
+    queryValidator(organizationContextQuerySchema),
     resolveMemberTeamsMiddleware,
     async (c) => {
-      const payload = c.get("organizationContext")
+      let payload = c.get("organizationContext")
+      const query = c.req.valid("query")
+
+      if (query.refreshRoles) {
+        const permission = ensureOrganizationAdminRole(c, "Only workspace owners and admins can refresh organization roles.")
+        if (!permission.ok) {
+          return c.json(permission.response, orgAccessFailureStatus(permission.response))
+        }
+
+        await seedDefaultOrganizationRoles(payload.organization.id)
+        const refreshedPayload = await getOrganizationContextForUser({
+          organizationId: payload.organization.id,
+          userId: normalizeDenTypeId("user", c.get("user").id),
+        })
+        if (!refreshedPayload) {
+          return c.json({ error: "organization_not_found" }, 404)
+        }
+
+        payload = refreshedPayload
+        c.set("organizationContext", payload)
+      }
+
       const owner = payload.members.find((member: typeof payload.members[number]) => member.isOwner) ?? null
       const cloudEnabled = organizationCloudEnabled(payload.organization.metadata, { orgMode: env.orgMode })
       const [ssoRows, scimRows] = await Promise.all([
@@ -641,14 +694,26 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         plan: parseOrganizationPlan(payload.organization.metadata),
         entitlements: getOrganizationEntitlements(payload.organization.metadata),
         capabilities: {
+          // Protocol capability: clients must see this explicit signal before
+          // calling the dashboard routes. Older Den versions omit the field,
+          // allowing newer Desktop builds to fail closed during a staggered
+          // rollout instead of calling an endpoint that does not exist yet.
+          orgManagedDashboards: true,
           // Expose the effective value, not the raw stored flag: Connect is
           // member-facing default-on unless an explicit org kill switch says no.
           mcpConnections: memberFacingMcpConnectionsEnabled(payload.organization.metadata, {
             gatingEnabled: env.mcpConnectionsGatingEnabled,
           }),
+          // Workflows/Code Mode are enabled for every organization; the field
+          // remains for published clients that still read it.
+          workflows: true,
           installLinks: organizationInstallLinksEnabled(payload.organization.metadata, {
             gatingEnabled: env.installLinksGatingEnabled,
           }),
+          // Effective offer: the deployment switch enables Web generally,
+          // while the platform-admin complimentary grant enables only this
+          // organization when the deployment switch is off.
+          openworkWeb: isOpenWorkWebAvailableForOrganization(payload.organization.metadata),
           ...(cloudEnabled ? { cloud: true } : {}),
         },
         authMethods: {

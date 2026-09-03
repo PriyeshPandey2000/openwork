@@ -10,6 +10,8 @@ const electronSidecarDir = resolve(desktopRoot, "resources", "sidecars");
 const electronHelperDir = resolve(desktopRoot, "resources", "helpers");
 const electronRoot = resolve(desktopRoot, "electron");
 const packagedServerRoot = resolve(desktopRoot, "server");
+const packagedRuntimeRoot = resolve(desktopRoot, ".electron-runtime", "node_modules");
+const sentryBuildConfigPath = resolve(desktopRoot, ".electron-runtime", "openwork-sentry.json");
 
 const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 const nodeCmd = process.execPath;
@@ -30,10 +32,29 @@ function run(command, args, cwd, env) {
   }
 }
 
+function writeSentryBuildConfig() {
+  const dsn = process.env.OPENWORK_DESKTOP_SENTRY_DSN?.trim() ?? "";
+  const tracesSampleRateRaw = process.env.OPENWORK_DESKTOP_SENTRY_TRACES_SAMPLE_RATE?.trim() ?? "";
+  const tracesSampleRate = tracesSampleRateRaw ? Number(tracesSampleRateRaw) : 0.01;
+  const config = {
+    dsn: dsn || null,
+    tracesSampleRate: Number.isFinite(tracesSampleRate) && tracesSampleRate >= 0 && tracesSampleRate <= 1
+      ? tracesSampleRate
+      : 0.01,
+  };
+  writeFileSync(sentryBuildConfigPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
 run(nodeCmd, [resolve(__dirname, "prepare-sidecar.mjs"), "--force", "--outdir", electronSidecarDir], desktopRoot);
 run(nodeCmd, [resolve(__dirname, "prepare-computer-use-helper.mjs"), "--force", "--outdir", electronHelperDir], desktopRoot);
+run(nodeCmd, [resolve(__dirname, "prepare-runtime-node-modules.mjs"), "--outdir", packagedRuntimeRoot], desktopRoot);
+writeSentryBuildConfig();
 // Build the server TS → JS so Electron can import it in-process
 run(pnpmCmd, ["--filter", "openwork-server", "build"], repoRoot);
+// automation-runner.mjs imports @openwork/headless-threads through its
+// published "default" export (dist/index.js); build it so plain-node
+// consumers resolve it in packaged layouts.
+run(pnpmCmd, ["--filter", "@openwork/headless-threads", "build"], repoRoot);
 // OPENWORK_ELECTRON_BUILD tells Vite to emit relative asset paths so
 // index.html resolves /assets/* correctly when loaded via file:// from
 // inside the packaged .app bundle.

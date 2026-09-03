@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Ref } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { AlertTriangle, Check, Loader2, Plug, Wrench } from "lucide-react";
 import { buttonVariants, DenButton } from "../../_components/ui/button";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
-import { getOrgAccessFlags } from "../../_lib/den-org";
+import { getOrgAccessFlags, getToolTesterRoute } from "../../_lib/den-org";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { IntegrationIcon } from "./integration-icon";
 import {
@@ -25,7 +25,6 @@ import {
   useMcpConnections,
   useMcpConnectionPresets,
 } from "./mcp-connections-data";
-import { McpToolRunner } from "./mcp-tool-runner";
 import { usePlugin } from "./plugin-data";
 import { useMcpAccountAuthorization } from "./use-mcp-account-authorization";
 
@@ -41,7 +40,7 @@ import { useMcpAccountAuthorization } from "./use-mcp-account-authorization";
 export function YourConnectionsScreen() {
   const { data: connections = [], isLoading, error, refetch } = useMcpConnections("usable");
   const { data: presets = [] } = useMcpConnectionPresets();
-  const { orgContext } = useOrgDashboard();
+  const { orgContext, orgSlug } = useOrgDashboard();
   const searchParams = useSearchParams();
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
@@ -82,7 +81,6 @@ export function YourConnectionsScreen() {
     <DashboardPageTemplate
       icon={Plug}
       title="Your Connections"
-      badgeLabel="Beta"
       description="Tools your organization has made available to you. Connect your own account where needed; workspace admins can test tools directly, and your AI coworker uses them with your permissions."
       colors={["#DBEAFE", "#1E3A8A", "#2563EB", "#93C5FD"]}
     >
@@ -127,6 +125,7 @@ export function YourConnectionsScreen() {
               }
               onConnect={() => void authorization.connect(connection.id)}
               onDisconnect={() => void handleDisconnectMyAccount(connection)}
+              toolTesterRoute={getToolTesterRoute(orgSlug)}
             />;
           })}
         </div>
@@ -158,6 +157,7 @@ function YourConnectionRow({
   rowRef,
   onConnect,
   onDisconnect,
+  toolTesterRoute,
 }: {
   connection: ExternalMcpConnection;
   isAdmin: boolean;
@@ -166,13 +166,14 @@ function YourConnectionRow({
   presets: ReturnType<typeof useMcpConnectionPresets>["data"];
   onSetup: (target: PluginMcpSetupTarget) => void;
   highlighted: boolean;
-  rowRef?: React.Ref<HTMLDivElement>;
+  rowRef?: Ref<HTMLDivElement>;
   polling: boolean;
   connecting: boolean;
   disconnecting: boolean;
   errorMessage: string | null;
   onConnect: () => void;
   onDisconnect: () => void;
+  toolTesterRoute: string;
 }) {
   const isPerMember = connection.credentialMode === "per_member";
   const needsAdminRecovery = !needsAdminSetup
@@ -187,7 +188,6 @@ function YourConnectionRow({
   const isNativeProvider = isNativeProviderConnectionId(connection.id, connection.nativeProviderKey);
   const canTestTools = !needsAdminSetup && !needsAdminRecovery && isAdmin
     && !isNativeProvider && connection.connectedForMe && !needsReconnect;
-  const [toolRunnerOpen, setToolRunnerOpen] = useState(false);
   const microsoftScopes = (connection.nativeProviderKey === "microsoft-365" || connection.id === "microsoft-365")
     ? (connection.grantedScopes ?? []).filter((scope) => MICROSOFT_365_DISPLAY_SCOPES.has(scope))
     : [];
@@ -286,17 +286,15 @@ function YourConnectionRow({
             </Link>
           ) : null}
           {canTestTools ? (
-            <DenButton
-              variant="secondary"
-              size="sm"
-              icon={Wrench}
-              onClick={() => setToolRunnerOpen((open) => !open)}
-              aria-expanded={toolRunnerOpen}
+            <Link
+              href={`${toolTesterRoute}?connectionId=${encodeURIComponent(connection.id)}`}
+              className={buttonVariants({ variant: "secondary", size: "sm", className: "h-8 w-8 !px-0" })}
               aria-label={`Test tools for ${connection.name}`}
               title={`Test tools for ${connection.name}`}
-              className="h-8 w-8 !px-0"
               data-testid={`toggle-mcp-tool-runner-${connection.id}`}
-            />
+            >
+              <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
+            </Link>
           ) : null}
           {canDisconnect ? (
             <DenButton variant="destructive" size="sm" loading={disconnecting} onClick={onDisconnect} data-testid={`disconnect-my-mcp-account-${connection.id}`}>
@@ -310,7 +308,6 @@ function YourConnectionRow({
           ) : null}
         </div>
       </div>
-      {toolRunnerOpen && canTestTools ? <McpToolRunner connection={connection} /> : null}
     </div>
   );
 }

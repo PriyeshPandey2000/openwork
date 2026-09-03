@@ -134,6 +134,15 @@ export type ExternalMcpOAuthConfiguration = {
   discovery?: Record<string, unknown>
 }
 
+export type ExternalMcpToolPolicy = {
+  version: 1
+  allDisabled: boolean
+  disabledTools: string[]
+  updatedByOrgMembershipId?: string
+  updatedByName?: string
+  updatedAt?: string
+}
+
 export type ExternalMcpCredentialHealth = {
   version: 1
   status: "ready" | "reconnect_required"
@@ -184,6 +193,16 @@ export const ExternalMcpConnectionTable = mysqlTable(
      * working until an administrator migrates them.
      */
     oauthConfiguration: compatJsonColumn<ExternalMcpOAuthConfiguration>("oauth_configuration"),
+    toolPolicy: compatJsonColumn<ExternalMcpToolPolicy>("tool_policy"),
+    /**
+     * When true, granted members may reach this connection as a standard MCP
+     * server through Den's per-connection endpoint: the provider's own tool
+     * catalog is listed and callable directly instead of only through the
+     * bounded search_capabilities/execute_capability pair. Access grants and
+     * the tool policy still apply on every request. Defaults to false so
+     * existing connections keep the bounded surface.
+     */
+    exposeDirectly: boolean("expose_directly").notNull().default(false),
     /**
      * How the connection's credential relates to people:
      * - "shared": one org-level credential (this row's token columns, or

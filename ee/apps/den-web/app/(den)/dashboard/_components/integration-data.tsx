@@ -18,7 +18,7 @@ export type IntegrationAccount = {
   repositorySelection?: "all" | "selected";
 };
 
-export type IntegrationRepoManifestKind = "marketplace" | "plugin" | null;
+export type IntegrationRepoManifestKind = "agent-plugin" | "marketplace" | "plugin" | null;
 
 export type IntegrationRepo = {
   connectorInstanceId?: string;
@@ -170,7 +170,7 @@ export function getMockReposFor(provider: IntegrationProvider, accountId: string
       id: `${tag}:openwork-plugins`,
       name: "openwork-plugins",
       fullName: `${accountToLabel(accountId)}/openwork-plugins`,
-      description: "Internal plugin marketplace: release kit, commit commands, linear groomer.",
+      description: "Internal plugin collection: release kit, commit commands, linear groomer.",
       hasPlugins: true,
     },
     {
@@ -479,12 +479,14 @@ export function useGithubInstallCompletion(input: { installationId: number | nul
               }
 
               const manifestKindValue = entry.manifestKind;
-              const manifestKind: IntegrationRepoManifestKind = manifestKindValue === "marketplace" || manifestKindValue === "plugin"
+              const manifestKind: IntegrationRepoManifestKind = manifestKindValue === "agent-plugin" || manifestKindValue === "marketplace" || manifestKindValue === "plugin"
                 ? manifestKindValue
                 : null;
               return [{
                 defaultBranch: asNullableString(entry.defaultBranch),
-                description: manifestKind === "marketplace"
+                description: manifestKind === "agent-plugin"
+                  ? "Agent Plugin manifest detected."
+                  : manifestKind === "marketplace"
                   ? "Claude marketplace manifest detected."
                   : manifestKind === "plugin"
                     ? "Claude plugin manifest detected."
@@ -529,17 +531,7 @@ export function useGithubAccountRepositories(connectorAccountId: string | null) 
     enabled: Boolean(connectorAccountId),
     queryKey: [...integrationQueryKeys.repos("github", connectorAccountId), "connected-account"] as const,
     queryFn: async (): Promise<IntegrationRepo[]> => {
-      const { response, payload } = await requestJson(
-        `/v1/connectors/github/accounts/${encodeURIComponent(connectorAccountId ?? "")}/repositories?limit=100`,
-        { method: "GET" },
-        20000,
-      );
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(payload, `Failed to load GitHub repositories (${response.status}).`));
-      }
-
-      return isRecord(payload) && Array.isArray(payload.items)
+      const parseRepositories = (payload: unknown): IntegrationRepo[] => isRecord(payload) && Array.isArray(payload.items)
         ? payload.items.flatMap((entry) => {
             if (!isRecord(entry)) {
               return [];
@@ -552,12 +544,14 @@ export function useGithubAccountRepositories(connectorAccountId: string | null) 
             }
 
             const manifestKindValue = entry.manifestKind;
-            const manifestKind: IntegrationRepoManifestKind = manifestKindValue === "marketplace" || manifestKindValue === "plugin"
+            const manifestKind: IntegrationRepoManifestKind = manifestKindValue === "agent-plugin" || manifestKindValue === "marketplace" || manifestKindValue === "plugin"
               ? manifestKindValue
               : null;
             return [{
               defaultBranch: asNullableString(entry.defaultBranch),
-              description: manifestKind === "marketplace"
+              description: manifestKind === "agent-plugin"
+                ? "Agent Plugin manifest detected."
+                : manifestKind === "marketplace"
                 ? "Claude marketplace manifest detected."
                 : manifestKind === "plugin"
                   ? "Claude plugin manifest detected."
@@ -573,6 +567,27 @@ export function useGithubAccountRepositories(connectorAccountId: string | null) 
             } satisfies IntegrationRepo];
           })
         : [];
+      const repositories: IntegrationRepo[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < 30; page += 1) {
+        const { response, payload } = await requestJson(
+          `/v1/connectors/github/accounts/${encodeURIComponent(connectorAccountId ?? "")}/repositories?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { method: "GET" },
+          20000,
+        );
+
+        if (!response.ok) {
+          throw new Error(getErrorMessage(payload, `Failed to load GitHub repositories (${response.status}).`));
+        }
+
+        repositories.push(...parseRepositories(payload));
+        const nextCursor = isRecord(payload) ? asString(payload.nextCursor) : null;
+        if (!nextCursor) {
+          break;
+        }
+        cursor = nextCursor;
+      }
+      return repositories;
     },
   });
 }
@@ -994,6 +1009,44 @@ export function useSetConnectorInstanceAutoImport() {
     onSuccess: (_result, variables) => {
       queryClient.invalidateQueries({
         queryKey: integrationQueryKeys.connectorInstanceConfiguration(variables.connectorInstanceId),
+      });
+    },
+  });
+}
+
+export function useSyncConnectorInstanceNow() {
+  const queryClient = useQueryClient();
+  const { runReauthableAction } = useOrgDashboard();
+
+  return useMutation({
+    mutationFn: async (connectorInstanceId: string) => {
+      let enqueuedCount: number | null = null;
+      await runReauthableAction("sync-connector-instance", async () => {
+        const { response, payload } = await requestJson(
+          `/v1/connector-instances/${encodeURIComponent(connectorInstanceId)}/sync-now`,
+          { method: "POST" },
+          15000,
+        );
+
+        if (!response.ok) {
+          throw getRequestError(payload, response, `Failed to sync connector instance (${response.status}).`);
+        }
+
+        const item = isRecord(payload) && isRecord(payload.item) ? payload.item : null;
+        if (!item || typeof item.enqueuedCount !== "number") {
+          throw new Error("Connector sync response was incomplete.");
+        }
+        enqueuedCount = item.enqueuedCount;
+      });
+      if (enqueuedCount === null) {
+        throw new Error("Connector sync response was incomplete.");
+      }
+      return enqueuedCount;
+    },
+    onSuccess: (_result, connectorInstanceId) => {
+      queryClient.invalidateQueries({ queryKey: integrationQueryKeys.all });
+      queryClient.invalidateQueries({
+        queryKey: integrationQueryKeys.connectorInstanceConfiguration(connectorInstanceId),
       });
     },
   });

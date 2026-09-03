@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ArrowLeft, Check, ChevronDown, ChevronRight, Loader2, Minus, MoreHorizontal, Pencil, Plug, Puzzle, RefreshCw, Search, Server, Trash2, Users, Wrench } from "lucide-react";
 import { buttonVariants, DenButton } from "../../_components/ui/button";
@@ -10,7 +10,7 @@ import { DenInput } from "../../_components/ui/input";
 import { DenNotice } from "../../_components/ui/notice";
 import { DenSelect } from "../../_components/ui/select";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
-import { getPluginRoute } from "../../_lib/den-org";
+import { getPluginRoute, getToolTesterRoute } from "../../_lib/den-org";
 import { getRequestError, requestJson } from "../../_lib/den-flow";
 import { IntegrationIcon } from "./integration-icon";
 import { Microsoft365Dialog } from "./microsoft-365-dialog";
@@ -22,6 +22,14 @@ import {
   type McpConnectionAccessMode,
 } from "./mcp-connection-editing";
 import { formatConnectionCreatorAttribution } from "./mcp-connection-display";
+import {
+  AUTH_TYPE_OPTIONS,
+  CREDENTIAL_MODE_OPTIONS,
+  credentialModeDescription,
+  MCP_OAUTH_REDIRECT_DOCS_URL,
+  SegmentedControl,
+  type SegmentedControlOption,
+} from "./mcp-connection-form-controls";
 import {
   connectionNeedsOAuthClientConfiguration,
   marketplaceConnectionNeedsAdminSetup,
@@ -61,7 +69,6 @@ import {
   useReviewMcpIssuer,
   useSaveNativeProviderClient,
   useStartMcpConnectionOAuth,
-  useTelegramConnection,
   useUpdateMcpConnection,
 } from "./mcp-connections-data";
 import {
@@ -75,12 +82,10 @@ import {
   toggleAllOptionalScopes,
 } from "./mcp-scope-selection";
 import { getPluginPartsSummary, pluginQueryKeys, usePlugins } from "./plugin-data";
-import { TelegramDialog } from "./telegram-dialog";
 import {
   ConnectorQuickAddGrid,
   GOOGLE_WORKSPACE_QUICK_ADD_ID,
   MICROSOFT_365_QUICK_ADD_ID,
-  TELEGRAM_QUICK_ADD_ID,
 } from "./connector-quick-add-grid";
 
 const OAUTH_POLL_INTERVAL_MS = 2000;
@@ -90,7 +95,6 @@ const MCP_REQUIREMENTS_DISCOVERY_DELAY_MS = 500;
 // single-URL requirements discovery.
 const SMART_RESOLVE_DELAY_MS = 800;
 const MCP_TOOL_PAGE_SIZE = 50;
-const MCP_OAUTH_REDIRECT_DOCS_URL = "https://openworklabs.com/docs/cloud/share-with-your-team/shared-mcp-connections#oauth-redirect-url";
 
 function isDiscoverableMcpUrl(value: string): boolean {
   try {
@@ -164,7 +168,7 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-type GithubPluginImportSkippedReason = "missing_url" | "local_unsupported" | "invalid_url" | "unsupported_auth";
+type GithubPluginImportSkippedReason = "headers_unsupported" | "invalid_config" | "invalid_url" | "local_unsupported" | "missing_url" | "unsupported_auth";
 
 type GithubPluginImportServer = {
   name: string;
@@ -198,7 +202,7 @@ function asString(value: unknown): string | null {
 }
 
 function parseSkippedReason(value: unknown): GithubPluginImportSkippedReason | null {
-  if (value === "missing_url" || value === "local_unsupported" || value === "invalid_url" || value === "unsupported_auth") {
+  if (value === "headers_unsupported" || value === "invalid_config" || value === "invalid_url" || value === "local_unsupported" || value === "missing_url" || value === "unsupported_auth") {
     return value;
   }
   return null;
@@ -247,6 +251,9 @@ function parseGithubPluginImportPreview(payload: unknown): GithubPluginImportPre
 function importServerStatus(server: GithubPluginImportServer): string {
   if (server.supported) return "ready";
   if (server.skippedReason === "missing_url") return "missing URL";
+  if (server.skippedReason === "local_unsupported") return "desktop-only";
+  if (server.skippedReason === "headers_unsupported") return "static headers unsupported";
+  if (server.skippedReason === "invalid_config") return "invalid config";
   return "unsupported";
 }
 
@@ -264,25 +271,34 @@ export function McpConnectionsScreen() {
   const deleteConnection = useDeleteMcpConnection();
   const saveNativeClient = useSaveNativeProviderClient();
   const reviewIssuer = useReviewMcpIssuer();
+  const resolveSmartBarConnection = useResolveMcpConnection();
 
   const [formOpen, setFormOpen] = useState(false);
   const [formPreset, setFormPreset] = useState<ExternalMcpPreset | null>(null);
+  const [formInitialView, setFormInitialView] = useState<"smart" | "advanced" | undefined>();
+  const [formInitialUrl, setFormInitialUrl] = useState("");
+  const [formInitialName, setFormInitialName] = useState("");
   const [editingConnection, setEditingConnection] = useState<ExternalMcpConnection | null>(null);
   const [configuringOAuthClient, setConfiguringOAuthClient] = useState(false);
   const [issuerReviewConnection, setIssuerReviewConnection] = useState<ExternalMcpConnection | null>(null);
   const [issuerReviewPreview, setIssuerReviewPreview] = useState<McpIssuerReview | null>(null);
   const [googleDialogMode, setGoogleDialogMode] = useState<"create" | "legacy" | null>(null);
   const [microsoftDialogOpen, setMicrosoftDialogOpen] = useState(false);
-  const [telegramDialogOpen, setTelegramDialogOpen] = useState(false);
-  const telegramConnection = useTelegramConnection(true);
   const showStagingBanner = orgContext ? shouldShowMcpConnectionsStagingBanner(orgContext.capabilities) : false;
   const [pollingConnectionId, setPollingConnectionId] = useState<string | null>(null);
   const [oauthClientConfigurationRequiredIds, setOAuthClientConfigurationRequiredIds] = useState<string[]>([]);
   const [connectionActionError, setConnectionActionError] = useState<{ connectionId: string; message: string } | null>(null);
-  const [connectionActionNotice, setConnectionActionNotice] = useState<string | null>(null);
+  const [connectionActionNotice, setConnectionActionNotice] = useState<ReactNode | null>(null);
   const [toolsConnectionId, setToolsConnectionId] = useState<string | null>(null);
+  const [smartQuery, setSmartQuery] = useState("");
+  const [smartBarState, setSmartBarState] = useState<"idle" | "waiting" | "resolving" | "done" | "error">("idle");
+  const [smartBarError, setSmartBarError] = useState<unknown>(null);
+  const [smartBarResolution, setSmartBarResolution] = useState<McpConnectionResolution | null>(null);
+  const [smartBarSubmitting, setSmartBarSubmitting] = useState(false);
+  const [instantAddingPresetId, setInstantAddingPresetId] = useState<string | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const handledQuickAddId = useRef<string | null>(null);
+  const smartBarRequestId = useRef(0);
 
   function openQuickAdd(id: string) {
     if (id === GOOGLE_WORKSPACE_QUICK_ADD_ID) {
@@ -294,23 +310,88 @@ export function McpConnectionsScreen() {
       setMicrosoftDialogOpen(true);
       return;
     }
-    if (id === TELEGRAM_QUICK_ADD_ID) {
-      setTelegramDialogOpen(true);
-      return;
-    }
 
     const preset = presets.find((entry) => entry.presetId === id);
     if (!preset) return;
+    setFormInitialView(undefined);
+    setFormInitialUrl("");
+    setFormInitialName("");
     setFormPreset(preset);
     setFormOpen(true);
   }
+
+  function openAdvancedSetup(initialName = "", initialUrl = "") {
+    createConnection.reset();
+    setFormPreset(null);
+    setFormInitialView("advanced");
+    setFormInitialName(initialName);
+    setFormInitialUrl(initialUrl);
+    setFormOpen(true);
+  }
+
+  function manageConnection(connectionId: string) {
+    const connection = connections.find((entry) => entry.id === connectionId);
+    if (!connection) return;
+    updateConnection.reset();
+    setConfiguringOAuthClient(false);
+    setEditingConnection(connection);
+  }
+
+  const smartBarInputKind = classifySmartAddInput(smartQuery);
+  const smartBarResolutionMode = smartBarInputKind === "url" || smartBarInputKind === "domain";
+
+  useEffect(() => {
+    const requestId = smartBarRequestId.current + 1;
+    smartBarRequestId.current = requestId;
+    setSmartBarResolution(null);
+    setSmartBarError(null);
+    if (!smartBarResolutionMode) {
+      setSmartBarState("idle");
+      return;
+    }
+
+    setSmartBarState("waiting");
+    const timer = window.setTimeout(async () => {
+      setSmartBarState("resolving");
+      try {
+        const result = await resolveSmartBarConnection.mutateAsync(smartQuery.trim());
+        if (smartBarRequestId.current !== requestId) return;
+        setSmartBarResolution(result);
+        setSmartBarState("done");
+      } catch (resolveFailure) {
+        if (smartBarRequestId.current !== requestId) return;
+        setSmartBarError(resolveFailure);
+        setSmartBarState("error");
+      }
+    }, SMART_RESOLVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [smartQuery, smartBarResolutionMode]);
+
+  const smartBarMatch = smartBarState === "done" ? smartBarResolution?.match ?? null : null;
+  const smartBarName = smartBarMatch?.suggestedName ?? smartBarResolution?.preset?.displayName ?? "";
+  const smartBarPlan = smartBarMatch
+    ? planSmartAdd(smartBarMatch.discovery, { name: smartBarName, url: smartBarMatch.url })
+    : null;
+  // Keep curated preset requirements authoritative over a probe that would
+  // otherwise look one-click, matching the smart dialog's planning rules.
+  const smartBarBlockers = smartBarPlan
+    ? smartBarPlan.readiness !== "one_click"
+      ? smartBarPlan.reasons
+      : smartBarResolution?.preset?.requiresOAuthClient
+        ? ["This provider needs a pre-registered OAuth app."]
+        : smartBarResolution?.preset?.authType === "apikey"
+          ? ["This provider needs your org's API key."]
+          : []
+    : [];
+  const smartBarOneClick = smartBarPlan?.readiness === "one_click" && smartBarBlockers.length === 0
+    ? smartBarPlan
+    : null;
 
   useEffect(() => {
     const quickAddId = searchParams.get("quickAdd");
     if (!quickAddId || handledQuickAddId.current === quickAddId) return;
     const isKnownTarget = quickAddId === GOOGLE_WORKSPACE_QUICK_ADD_ID
       || quickAddId === MICROSOFT_365_QUICK_ADD_ID
-      || quickAddId === TELEGRAM_QUICK_ADD_ID
       || presets.some((preset) => preset.presetId === quickAddId);
     if (!isKnownTarget) return;
     handledQuickAddId.current = quickAddId;
@@ -408,6 +489,81 @@ export function McpConnectionsScreen() {
     }
   }
 
+  async function handleSmartBarSubmit() {
+    if (!smartBarOneClick) return;
+    setSmartBarSubmitting(true);
+    setConnectionActionError(null);
+    setConnectionActionNotice(null);
+    try {
+      await handleCreate(smartBarOneClick.input, {
+        startOAuth: smartBarOneClick.input.authType === "oauth" && smartBarOneClick.input.credentialMode === "shared",
+      });
+      setSmartQuery("");
+      setConnectionActionNotice(`${smartBarOneClick.input.name} added for everyone in ${orgContext?.organization.name ?? "the organization"}.`);
+      await refetch();
+    } catch (submitError) {
+      setConnectionActionError({
+        connectionId: "smart-bar",
+        message: submitError instanceof Error ? submitError.message : "Failed to add the MCP connection.",
+      });
+    } finally {
+      setSmartBarSubmitting(false);
+    }
+  }
+
+  async function handleUndoInstantAdd(connectionId: string) {
+    setConnectionActionError(null);
+    try {
+      await deleteConnection.mutateAsync(connectionId);
+      setConnectionActionNotice(null);
+      await refetch();
+    } catch (deleteError) {
+      setConnectionActionError({
+        connectionId,
+        message: deleteError instanceof Error ? deleteError.message : "Failed to undo the connector addition.",
+      });
+    }
+  }
+
+  async function handleInstantAdd(preset: ExternalMcpPreset) {
+    setInstantAddingPresetId(preset.presetId);
+    setConnectionActionError(null);
+    setConnectionActionNotice(null);
+    try {
+      const created = await createConnection.mutateAsync({
+        name: preset.displayName,
+        url: preset.url,
+        authType: "none",
+        credentialMode: "shared",
+        access: { orgWide: true, memberIds: [], teamIds: [] },
+      });
+      const orgName = orgContext?.organization.name ?? "the organization";
+      const toolTesterHref = `${getToolTesterRoute(orgSlug)}?connectionId=${encodeURIComponent(created.id)}`;
+      setConnectionActionNotice(
+        <>
+          {preset.displayName} added for everyone in {orgName}.{" "}
+          <Link href={toolTesterHref} className="font-semibold underline underline-offset-2">Test tools</Link>
+          {" · "}
+          <button
+            type="button"
+            className="font-semibold underline underline-offset-2"
+            onClick={() => void handleUndoInstantAdd(created.id)}
+          >
+            Undo
+          </button>
+        </>,
+      );
+      await refetch();
+    } catch (createError) {
+      setConnectionActionError({
+        connectionId: preset.presetId,
+        message: createError instanceof Error ? createError.message : "Failed to add the MCP connection.",
+      });
+    } finally {
+      setInstantAddingPresetId(null);
+    }
+  }
+
   async function handleUpdate(input: UpdateMcpConnectionInput): Promise<UpdatedMcpConnection> {
     setConnectionActionError(null);
     setConnectionActionNotice(null);
@@ -425,14 +581,14 @@ export function McpConnectionsScreen() {
 
   function handleRemove(connection: ExternalMcpConnection) {
     const confirmed = window.confirm(
-      `Delete ${connection.name}? This can remove access grants, per-member authorization state, and plugin or marketplace bindings.`,
+      `Delete ${connection.name}? This can remove access grants, per-member authorization state, and plugin or collection bindings.`,
     );
     if (confirmed) deleteConnection.mutate(connection.id);
   }
 
   async function handleDisconnect(connection: ExternalMcpConnection) {
     const confirmed = window.confirm(
-      `Disconnect ${connection.name}? This signs out every associated account for this connection, but keeps the MCP server setup, access rules, and plugin or marketplace bindings so you can reconnect later.`,
+      `Disconnect ${connection.name}? This signs out every associated account for this connection, but keeps the MCP server setup, access rules, and plugin or collection bindings so you can reconnect later.`,
     );
     if (!confirmed) return;
     setConnectionActionError(null);
@@ -483,7 +639,6 @@ export function McpConnectionsScreen() {
     <DashboardPageTemplate
       icon={Plug}
       title="Connectors"
-      badgeLabel="Beta"
       description="Connectors is where you can add MCP servers that your whole team can use."
       colors={["#E2E8F0", "#020617", "#0F172A", "#94A3B8"]}
     >
@@ -491,7 +646,7 @@ export function McpConnectionsScreen() {
         <div data-testid="mcp-connections-staging-banner" className="mb-6 rounded-[24px] border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] leading-6 text-amber-800">
           <p className="font-semibold text-amber-900">OpenWork Connect (beta) is staged for this org.</p>
           <p className="mt-1">
-            Connectors and marketplace capabilities you set up here stay staged and invisible to members until a platform admin enables OpenWork Connect (beta) for this org. Admin management remains fully usable.
+            Connectors and collection capabilities you set up here stay staged and invisible to members until a platform admin enables OpenWork Connect (beta) for this org. Admin management remains fully usable.
           </p>
         </div>
       ) : null}
@@ -514,27 +669,129 @@ export function McpConnectionsScreen() {
         </div>
       ) : null}
 
-      <div className="mb-6">
-        <DenButton
-          type="button"
-          icon={Server}
-          onClick={() => {
-            setFormPreset(null);
-            setFormOpen(true);
-          }}
-        >
-          Add MCP
-        </DenButton>
-      </div>
-
       <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400">Quick add</h3>
       <div className="mb-8">
-        <ConnectorQuickAddGrid
-          connections={connections}
-          presets={presets}
-          telegramConnected={Boolean(telegramConnection.data)}
-          onSelect={openQuickAdd}
-        />
+        <div className="flex items-center gap-3">
+          <div className="min-w-0 flex-1">
+            <DenInput
+              icon={Search}
+              iconSize={20}
+              value={smartQuery}
+              onChange={(event) => setSmartQuery(event.target.value)}
+              placeholder="Search connectors — or paste any MCP server URL to add it"
+              data-testid="connector-smart-bar"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={() => openAdvancedSetup()}
+            className="shrink-0 text-[12px] font-medium text-gray-500 underline decoration-gray-300 underline-offset-4 transition hover:text-gray-900"
+          >
+            Advanced setup
+          </button>
+        </div>
+        <p className="mt-1.5 text-[11px] text-gray-400">
+          Typing filters the tiles below. Pasting a URL checks the server and offers to add it right here.
+        </p>
+
+        {smartBarState === "waiting" || smartBarState === "resolving" ? (
+          <div className="mt-4 flex items-center gap-2.5 rounded-2xl border border-gray-100 bg-gray-50 px-4 py-3.5 text-[13px] text-gray-500" role="status">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Checking the server…
+          </div>
+        ) : null}
+
+        {smartBarState === "error" ? (
+          <div className="mt-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3.5 text-[13px] text-red-700" role="alert">
+            {smartBarError instanceof Error ? smartBarError.message : "The lookup failed. Try again, or set the server up manually."}
+          </div>
+        ) : null}
+
+        {smartBarState === "done" && !smartBarMatch ? (
+          <div className="mt-4 flex items-center justify-between gap-4 rounded-2xl border border-gray-100 bg-gray-50 px-4 py-3.5 text-[13px] leading-5 text-gray-600">
+            <span>{smartBarResolution?.reason ?? (smartBarResolution?.preset
+              ? `We found ${smartBarResolution.preset.displayName}, but couldn't verify the server automatically.`
+              : `We couldn't find an MCP server for "${smartQuery.trim()}".`)}</span>
+            <button
+              type="button"
+              onClick={() => openAdvancedSetup(
+                smartBarResolution?.preset?.displayName ?? "",
+                smartBarResolution?.preset?.url ?? (smartBarInputKind === "domain" ? `https://${smartQuery.trim()}` : smartQuery.trim()),
+              )}
+              className="shrink-0 font-medium underline underline-offset-2"
+            >
+              Advanced setup
+            </button>
+          </div>
+        ) : null}
+
+        {smartBarMatch ? (
+          <div data-testid="smart-bar-result-card" className="mt-4 rounded-2xl border border-gray-200 bg-white p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+              <div className="flex min-w-0 flex-1 items-start gap-3">
+                <IntegrationIcon name={smartBarName} serviceUrl={smartBarMatch.url} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[14px] font-semibold text-gray-900">{smartBarName}</p>
+                  <p className="mt-0.5 truncate text-[11px] text-gray-400">{smartBarMatch.url}</p>
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <DenButton
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => openAdvancedSetup(smartBarName, smartBarMatch.url)}
+                >
+                  Options
+                </DenButton>
+                <DenButton
+                  variant="primary"
+                  size="sm"
+                  loading={smartBarSubmitting}
+                  disabled={!smartBarOneClick}
+                  onClick={() => void handleSmartBarSubmit()}
+                  data-testid="smart-bar-submit"
+                >
+                  Add connection
+                </DenButton>
+              </div>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px] font-medium">
+              <span className="rounded-full bg-gray-100 px-2.5 py-1 text-gray-700">{smartAddAuthLabel(smartBarMatch.discovery)}</span>
+              {typeof smartBarMatch.discovery.tools.count === "number" ? (
+                <span className="rounded-full bg-gray-100 px-2.5 py-1 text-gray-700">
+                  {smartBarMatch.discovery.tools.count} tool{smartBarMatch.discovery.tools.count === 1 ? "" : "s"}
+                </span>
+              ) : null}
+              {smartBarOneClick ? (
+                <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">Ready to add</span>
+              ) : null}
+            </div>
+            {smartBarBlockers.length > 0 ? (
+              <div className="mt-3 rounded-xl bg-amber-50 px-3 py-2.5 text-[12px] text-amber-800">
+                Needs a little more setup: {smartBarBlockers.join(" · ")}{" "}
+                <button
+                  type="button"
+                  onClick={() => openAdvancedSetup(smartBarName, smartBarMatch.url)}
+                  className="font-semibold underline underline-offset-2"
+                >
+                  Continue setup
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="mt-5">
+          <ConnectorQuickAddGrid
+            connections={connections}
+            presets={presets}
+            onSelect={openQuickAdd}
+            filter={smartBarResolutionMode ? "" : smartQuery}
+            onManage={manageConnection}
+            onInstantAdd={(preset) => void handleInstantAdd(preset)}
+            instantAddingPresetId={instantAddingPresetId}
+          />
+        </div>
       </div>
 
       <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400">Your connectors</h3>
@@ -597,11 +854,17 @@ export function McpConnectionsScreen() {
       <AddConnectionDialog
         open={formOpen}
         preset={formPreset}
+        initialView={formInitialView}
+        initialUrl={formInitialUrl}
+        initialName={formInitialName}
         submitting={createConnection.isPending}
         error={createConnection.error}
         onClose={() => {
           setFormOpen(false);
           setFormPreset(null);
+          setFormInitialView(undefined);
+          setFormInitialUrl("");
+          setFormInitialName("");
         }}
         onSubmit={handleCreate}
       />
@@ -668,8 +931,6 @@ export function McpConnectionsScreen() {
           setMicrosoftDialogOpen(false);
         }}
       />
-
-      <TelegramDialog open={telegramDialogOpen} onClose={() => setTelegramDialogOpen(false)} />
     </DashboardPageTemplate>
   );
 }
@@ -757,7 +1018,7 @@ function ImportPluginConnectionDialog({
       return;
     }
     if (!marketplaceId) {
-      setError("Choose a marketplace.");
+      setError("Choose a collection.");
       return;
     }
     if (selectedServerKeys.length === 0 && selectedSkillKeys.length === 0) {
@@ -823,7 +1084,7 @@ function ImportPluginConnectionDialog({
       >
         <h2 className="text-[18px] font-semibold tracking-[-0.02em] text-gray-950">Add plugin connection</h2>
         <p className="mt-1 text-[13px] leading-6 text-gray-600">
-          Import a plugin from GitHub. Remote MCPs become Den-hosted org connections; imported skills are saved as skill config objects on the plugin and published through marketplaces.
+          Import a plugin from GitHub. Remote MCPs become Den-hosted org connections; imported skills are saved as skill config objects on the plugin and published through collections.
         </p>
 
         <div className="mt-5 rounded-2xl border border-gray-100 bg-gray-50 p-4">
@@ -941,7 +1202,7 @@ function ImportPluginConnectionDialog({
                 </DenSelect>
               </label>
               <label className="block">
-                <span className="mb-1.5 block text-[12px] font-medium text-gray-700">Marketplace</span>
+                <span className="mb-1.5 block text-[12px] font-medium text-gray-700">Collection</span>
                 <DenSelect value={marketplaceId} onChange={(event) => setMarketplaceId(event.target.value)} disabled={busy}>
                   {marketplaces.map((marketplace) => (
                     <option key={marketplace.id} value={marketplace.id}>
@@ -1661,8 +1922,8 @@ function McpToolCatalog({ connection }: { connection: ExternalMcpConnection }) {
   const [visibleToolLimit, setVisibleToolLimit] = useState(MCP_TOOL_PAGE_SIZE);
   const filteredTools = useMemo(() => {
     const needle = toolSearch.trim().toLowerCase();
-    if (!needle) return catalog.data ?? [];
-    return (catalog.data ?? []).filter((tool) =>
+    if (!needle) return catalog.data?.tools ?? [];
+    return (catalog.data?.tools ?? []).filter((tool) =>
       [tool.name, tool.title, tool.annotations?.title, tool.description]
         .some((value) => value?.toLowerCase().includes(needle)),
     );
@@ -1688,7 +1949,7 @@ function McpToolCatalog({ connection }: { connection: ExternalMcpConnection }) {
         </DenButton>
       </div>
 
-      {catalog.data && catalog.data.length > 0 ? (
+      {catalog.data && catalog.data.tools.length > 0 ? (
         <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="w-full sm:max-w-sm">
             <DenInput
@@ -1704,8 +1965,8 @@ function McpToolCatalog({ connection }: { connection: ExternalMcpConnection }) {
           </div>
           <p className="shrink-0 text-[11px] font-medium text-gray-500" role="status">
             {toolSearch.trim()
-              ? `${filteredTools.length} of ${catalog.data.length} tools`
-              : `${catalog.data.length} ${catalog.data.length === 1 ? "tool" : "tools"} exposed`}
+              ? `${filteredTools.length} of ${catalog.data.tools.length} tools`
+              : `${catalog.data.tools.length} ${catalog.data.tools.length === 1 ? "tool" : "tools"} exposed`}
           </p>
         </div>
       ) : null}
@@ -1719,7 +1980,7 @@ function McpToolCatalog({ connection }: { connection: ExternalMcpConnection }) {
         <div className="mt-4 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-[12px] leading-5 text-red-700">
           {catalog.error instanceof Error ? catalog.error.message : "Could not read this MCP's tools."}
         </div>
-      ) : catalog.data?.length === 0 ? (
+      ) : catalog.data?.tools.length === 0 ? (
         <div className="mt-4 rounded-xl border border-gray-200 bg-white px-4 py-3 text-[12px] text-gray-500">
           This MCP is connected but does not currently expose any tools.
         </div>
@@ -1810,64 +2071,35 @@ function McpToolCatalog({ connection }: { connection: ExternalMcpConnection }) {
   );
 }
 
-type SegmentedControlOption<TValue extends string> = {
-  value: TValue;
-  label: string;
-};
-
-function SegmentedControl<TValue extends string>({
-  options,
-  value,
-  onChange,
-  disabled = false,
-}: {
-  options: SegmentedControlOption<TValue>[];
-  value: TValue;
-  onChange: (value: TValue) => void;
-  disabled?: boolean;
-}) {
-  const gridColumns = options.length === 2 ? "grid-cols-2" : "grid-cols-3";
-
-  return (
-    <div className={`grid ${gridColumns} gap-1 rounded-full border border-gray-200 bg-gray-50 p-1`} role="group">
-      {options.map((option) => (
-        <button
-          key={option.value}
-          type="button"
-          disabled={disabled}
-          aria-pressed={value === option.value}
-          onClick={() => onChange(option.value)}
-          className={`rounded-full px-3 py-1.5 text-[12px] font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
-            value === option.value
-              ? "bg-white text-gray-900 shadow-[0_1px_2px_rgba(15,23,42,0.08)]"
-              : "text-gray-500 hover:text-gray-900"
-          }`}
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 type AddConnectionAccessMode = McpConnectionAccessMode;
-
-const AUTH_TYPE_OPTIONS: SegmentedControlOption<ExternalMcpAuthType>[] = [
-  { value: "oauth", label: "OAuth" },
-  { value: "apikey", label: "API key" },
-  { value: "none", label: "None" },
-];
-
-const CREDENTIAL_MODE_OPTIONS: SegmentedControlOption<ExternalMcpCredentialMode>[] = [
-  { value: "per_member", label: "Individual accounts" },
-  { value: "shared", label: "One org account" },
-];
 
 const ACCESS_MODE_OPTIONS: SegmentedControlOption<AddConnectionAccessMode>[] = [
   { value: "everyone", label: "Everyone" },
   { value: "teams", label: "Specific teams" },
   { value: "people", label: "Specific people" },
 ];
+
+function ExposeDirectlyField({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }) {
+  return (
+    <div>
+      <label className="flex items-start gap-2 text-[12px] text-gray-700">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={checked}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span>
+          <span className="font-medium">Expose directly as an MCP server</span>
+          <span className="mt-0.5 block text-[11px] leading-5 text-gray-500">
+            The agent sees this server&apos;s own tools instead of going through search and execute.
+            Access grants and the tool policy still apply.
+          </span>
+        </span>
+      </label>
+    </div>
+  );
+}
 
 function EditConnectionDialog({
   connection,
@@ -1889,6 +2121,7 @@ function EditConnectionDialog({
   const [url, setUrl] = useState("");
   const [authType, setAuthType] = useState<ExternalMcpAuthType>("oauth");
   const [credentialMode, setCredentialMode] = useState<ExternalMcpCredentialMode>("shared");
+  const [exposeDirectly, setExposeDirectly] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [showOAuthClient, setShowOAuthClient] = useState(false);
   const [oauthClientId, setOAuthClientId] = useState("");
@@ -1905,6 +2138,7 @@ function EditConnectionDialog({
     setUrl(connection.url);
     setAuthType(connection.authType);
     setCredentialMode(connection.credentialMode);
+    setExposeDirectly(connection.exposeDirectly);
     setApiKey("");
     setShowOAuthClient(configureOAuthClient || Boolean(connection.oauthClientId));
     setOAuthClientId(connection.oauthClientId ?? "");
@@ -1967,6 +2201,7 @@ function EditConnectionDialog({
       url: url.trim(),
       authType,
       credentialMode: proposedCredentialMode,
+      exposeDirectly,
       ...(!marketplaceManaged && authType === "apikey" && trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
       ...(authType === "oauth" && showOAuthClient && trimmedClientId
         ? {
@@ -2008,7 +2243,7 @@ function EditConnectionDialog({
         {marketplaceManaged ? (
           <div className="mt-4 rounded-2xl border border-blue-200 bg-blue-50 p-4 text-[12px] leading-5 text-blue-800" data-testid="marketplace-managed-identity-note">
             <p className="font-semibold text-blue-900">Server and authentication are managed by {marketplaceIdentityOwnerNames(marketplaceOwners)}.</p>
-            <p className="mt-1">Configure organization OAuth credentials here. Change the server URL or authentication type in the marketplace plugin definition.</p>
+            <p className="mt-1">Configure organization OAuth credentials here. Change the server URL or authentication type in the collection plugin definition.</p>
           </div>
         ) : null}
 
@@ -2153,6 +2388,8 @@ function EditConnectionDialog({
             ) : null}
           </div>
 
+          <ExposeDirectlyField checked={exposeDirectly} onChange={setExposeDirectly} />
+
           <div>
             <label className="mb-1.5 block text-[12px] font-medium text-gray-700">Who can use this?</label>
             <SegmentedControl
@@ -2240,6 +2477,9 @@ function EditConnectionDialog({
 function AddConnectionDialog({
   open,
   preset,
+  initialView,
+  initialUrl,
+  initialName,
   submitting,
   error,
   onClose,
@@ -2247,6 +2487,9 @@ function AddConnectionDialog({
 }: {
   open: boolean;
   preset: ExternalMcpPreset | null;
+  initialView?: "smart" | "advanced";
+  initialUrl?: string;
+  initialName?: string;
   submitting: boolean;
   error: unknown;
   onClose: () => void;
@@ -2272,6 +2515,7 @@ function AddConnectionDialog({
   const [url, setUrl] = useState(preset?.url ?? "");
   const [authType, setAuthType] = useState<ExternalMcpAuthType>(preset?.authType ?? "oauth");
   const [credentialMode, setCredentialMode] = useState<ExternalMcpCredentialMode>("per_member");
+  const [exposeDirectly, setExposeDirectly] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [showOAuthClient, setShowOAuthClient] = useState(Boolean(preset?.requiresOAuthClient));
   const [oauthClientId, setOAuthClientId] = useState("");
@@ -2288,7 +2532,7 @@ function AddConnectionDialog({
 
   useEffect(() => {
     if (!open) return;
-    setView(preset ? "advanced" : "smart");
+    setView(initialView ?? (preset ? "advanced" : "smart"));
     setSmartQuery("");
     setSmartState("idle");
     setSmartError(null);
@@ -2296,10 +2540,11 @@ function AddConnectionDialog({
     setSmartName("");
     smartRequestId.current += 1;
     smartResolveDelayRef.current = SMART_RESOLVE_DELAY_MS;
-    setName(preset?.displayName ?? "");
-    setUrl(preset?.url ?? "");
+    setName(preset?.displayName ?? initialName ?? "");
+    setUrl(preset?.url ?? initialUrl ?? "");
     setAuthType(preset?.authType ?? "oauth");
     setCredentialMode("per_member");
+    setExposeDirectly(false);
     setApiKey("");
     setShowOAuthClient(Boolean(preset?.requiresOAuthClient));
     setOAuthClientId("");
@@ -2314,7 +2559,7 @@ function AddConnectionDialog({
     setAccessMode("everyone");
     setSelectedTeamIds([]);
     setSelectedMemberIds([]);
-  }, [open, preset]);
+  }, [initialName, initialUrl, initialView, open, preset]);
 
   const teams = useMemo(() => orgContext?.teams ?? [], [orgContext?.teams]);
   const members = useMemo(
@@ -2497,6 +2742,7 @@ function AddConnectionDialog({
       url: url.trim(),
       authType,
       credentialMode: authType === "oauth" ? credentialMode : "shared",
+      exposeDirectly,
       apiKey: authType === "apikey" ? apiKey.trim() : undefined,
       oauthClient: showOAuthClientFields && trimmedClientId
         ? {
@@ -2865,12 +3111,12 @@ function AddConnectionDialog({
               <label className="mb-1.5 block text-[12px] font-medium text-gray-700">Whose account does the AI use?</label>
               <SegmentedControl options={CREDENTIAL_MODE_OPTIONS} value={credentialMode} onChange={setCredentialMode} />
               <p className="mt-1.5 text-[12px] leading-5 text-gray-500">
-                {credentialMode === "per_member"
-                  ? "Each person signs in with their own account from Your Connections. Their AI acts as them, with their permissions."
-                  : "You sign in once with a single account — everyone granted access acts as it. Good for bot or service accounts."}
+                {credentialModeDescription(credentialMode)}
               </p>
             </div>
           ) : null}
+
+          <ExposeDirectlyField checked={exposeDirectly} onChange={setExposeDirectly} />
 
           <div>
             <label className="mb-1.5 block text-[12px] font-medium text-gray-700">Who can use this?</label>

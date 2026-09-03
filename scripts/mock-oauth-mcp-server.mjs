@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 3978);
 const issuer = process.env.ISSUER || `http://${host}:${port}`;
+const extraToolCount = Number(process.env.MOCK_EXTRA_TOOL_COUNT || 0);
 const autoApprove = process.env.AUTO_APPROVE !== "0";
 const disableDcr = process.env.DISABLE_DCR === "1";
 const strictOAuth = process.argv.includes("--strict") || process.env.STRICT_OAUTH === "1";
@@ -31,6 +32,14 @@ const errorToolMode = (process.env.MOCK_ERROR_TOOL_MODE || "result").trim();
 const errorToolConnectUrl = (process.env.MOCK_ERROR_TOOL_CONNECT_URL || "https://connect.example.test/salesforce/start").trim();
 const errorToolProvider = (process.env.MOCK_ERROR_TOOL_PROVIDER || "salesforce").trim();
 const allowUnauthenticatedMcp = process.env.MOCK_ALLOW_UNAUTHENTICATED_MCP === "1";
+const syntheticTools = Array.from({ length: extraToolCount }, (_, index) => {
+  const i = index + 1;
+  return {
+    name: `mock_tool_${i}`,
+    description: `Synthetic scale tool ${i} for capability search volume testing; keyword kw${i}.`,
+    inputSchema: { type: "object", properties: {} },
+  };
+});
 
 const clients = new Map();
 const codes = new Map();
@@ -38,6 +47,7 @@ const tokens = new Set();
 const refreshTokens = new Set();
 const requests = [];
 const drafts = [];
+let agentWorkloads = [];
 
 const gmailThreadId = "thread-q3-launch";
 
@@ -120,6 +130,7 @@ function json(res, status, body, headers = {}) {
 function text(res, status, body, headers = {}) {
   res.writeHead(status, {
     "access-control-allow-origin": "*",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     "content-type": "text/html; charset=utf-8",
     ...headers,
   });
@@ -144,6 +155,149 @@ function readBody(req) {
     req.on("end", () => resolve(raw));
     req.on("error", reject);
   });
+}
+
+function agentContentText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(agentContentText).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  if (typeof value.text === "string") return value.text;
+  return agentContentText(value.content);
+}
+
+function validateAgentWorkloads(value) {
+  if (!Array.isArray(value)) throw new Error("agent workloads must be an array");
+  const markers = new Set();
+  return value.map((workload) => {
+    if (!workload || typeof workload !== "object") throw new Error("agent workload must be an object");
+    const promptMarker = typeof workload.promptMarker === "string" ? workload.promptMarker.trim() : "";
+    const finalReply = typeof workload.finalReply === "string" ? workload.finalReply : "";
+    if (!promptMarker || !finalReply || !Array.isArray(workload.steps) || workload.steps.length === 0) {
+      throw new Error("agent workload needs promptMarker, finalReply, and at least one step");
+    }
+    if (markers.has(promptMarker)) throw new Error(`duplicate agent workload marker: ${promptMarker}`);
+    markers.add(promptMarker);
+    const steps = workload.steps.map((step) => {
+      if (!step || typeof step !== "object" || typeof step.tool !== "string" || !step.tool.trim()) {
+        throw new Error(`agent workload ${promptMarker} has an invalid tool step`);
+      }
+      if (!step.arguments || typeof step.arguments !== "object" || Array.isArray(step.arguments)) {
+        throw new Error(`agent workload ${promptMarker} tool ${step.tool} needs object arguments`);
+      }
+      return { tool: step.tool.trim(), arguments: structuredClone(step.arguments) };
+    });
+    return { promptMarker, finalReply, steps };
+  });
+}
+
+function offeredAgentTool(body, wanted) {
+  if (!Array.isArray(body?.tools)) return null;
+  const names = body.tools.flatMap((tool) => (
+    tool && typeof tool === "object" && typeof tool.function?.name === "string"
+      ? [tool.function.name]
+      : []
+  ));
+  return names.find((name) => name === wanted)
+    ?? names.find((name) => name.endsWith(`_${wanted}`))
+    ?? null;
+}
+
+function agentStream(res, model, chunks) {
+  res.writeHead(200, {
+    "access-control-allow-origin": "*",
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  let delayMs = 150;
+  for (const chunk of chunks) {
+    setTimeout(() => {
+      if (!res.writableEnded) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    }, delayMs);
+    delayMs += 150;
+  }
+  setTimeout(() => {
+    if (!res.writableEnded) res.end("data: [DONE]\n\n");
+  }, delayMs);
+}
+
+function agentChunk(model, delta, finishReason = null) {
+  return {
+    id: `chatcmpl-mock-agent-${randomUUID()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+}
+
+async function handleAgentCompletion(req, res, entry) {
+  const body = await readJson(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    json(res, 400, { error: { message: "completion body must be an object" } });
+    return;
+  }
+  const model = typeof body.model === "string" ? body.model : "mock-agent-workload-model";
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const conversationText = messages.map(agentContentText).join("\n");
+  const matchedMarkers = agentWorkloads
+    .filter((workload) => conversationText.includes(workload.promptMarker))
+    .map((workload) => workload.promptMarker);
+  const completedTools = messages.filter((message) => message && typeof message === "object" && message.role === "tool").length;
+  const baseRequest = { model, matchedMarkers, completedTools };
+
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    entry.agentCompletion = { ...baseRequest, kind: "utility", promptMarker: matchedMarkers[0] ?? null, toolName: null, arguments: {} };
+    agentStream(res, model, [
+      agentChunk(model, { role: "assistant" }),
+      agentChunk(model, { content: "Active session workload" }),
+      agentChunk(model, {}, "stop"),
+    ]);
+    return;
+  }
+  if (matchedMarkers.length !== 1) {
+    entry.agentCompletion = { ...baseRequest, kind: "error", promptMarker: null, toolName: null, arguments: {} };
+    json(res, 400, { error: { message: `expected one workload marker, found ${matchedMarkers.length}` } });
+    return;
+  }
+  const workload = agentWorkloads.find((candidate) => candidate.promptMarker === matchedMarkers[0]);
+  if (!workload) throw new Error("matched agent workload disappeared");
+  if (completedTools >= workload.steps.length) {
+    entry.agentCompletion = { ...baseRequest, kind: "final", promptMarker: workload.promptMarker, toolName: null, arguments: {} };
+    agentStream(res, model, [
+      agentChunk(model, { role: "assistant" }),
+      agentChunk(model, { content: workload.finalReply }),
+      agentChunk(model, {}, "stop"),
+    ]);
+    return;
+  }
+  const step = workload.steps[completedTools];
+  const toolName = offeredAgentTool(body, step.tool);
+  if (!toolName) {
+    entry.agentCompletion = { ...baseRequest, kind: "error", promptMarker: workload.promptMarker, toolName: step.tool, arguments: step.arguments };
+    json(res, 400, { error: { message: `tool ${step.tool} was not offered to the mock agent` } });
+    return;
+  }
+  const callId = `call_${workload.promptMarker.replace(/[^a-zA-Z0-9_-]/g, "_")}_${completedTools + 1}`;
+  entry.agentCompletion = {
+    ...baseRequest,
+    kind: "tool",
+    promptMarker: workload.promptMarker,
+    toolName,
+    arguments: step.arguments,
+  };
+  agentStream(res, model, [
+    agentChunk(model, { role: "assistant" }),
+    agentChunk(model, {
+      tool_calls: [{
+        index: 0,
+        id: callId,
+        type: "function",
+        function: { name: toolName, arguments: JSON.stringify(step.arguments) },
+      }],
+    }),
+    agentChunk(model, {}, "tool_calls"),
+  ]);
 }
 
 async function readJson(req) {
@@ -195,9 +349,11 @@ function authorizationServerMetadata() {
 
 function basicClient(req) {
   const header = req.headers.authorization || "";
-  const match = header.match(/^Basic\s+(.+)$/i);
-  if (!match) return null;
-  const decoded = Buffer.from(match[1], "base64").toString("utf8");
+  if (header.length < 7 || header.slice(0, 6).toLowerCase() !== "basic ") return null;
+  let credentialStart = 6;
+  while (header[credentialStart] === " ") credentialStart += 1;
+  if (credentialStart === header.length) return null;
+  const decoded = Buffer.from(header.slice(credentialStart), "base64").toString("utf8");
   const separator = decoded.indexOf(":");
   if (separator === -1) return { clientId: decoded, clientSecret: "" };
   return {
@@ -307,7 +463,7 @@ function authorize(req, res, url) {
     <h1>Mock MCP OAuth</h1>
     <p>This fake OAuth provider is for OpenWork MCP end-to-end tests.</p>
     ${requestedScopesHtml}
-    <form method="post" action="${approveUrl.pathname}${approveUrl.search}">
+    <form method="post" action="${escapeHtml(`${approveUrl.pathname}${approveUrl.search}`)}">
       <button style="font: inherit; padding: 10px 14px;">Approve OpenWork</button>
     </form>
   </body>
@@ -450,7 +606,29 @@ function mcpResult(message) {
               properties: { text: { type: "string" } },
               required: ["text"],
             },
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
           },
+          {
+            name: "mock_batch",
+            description: "Echo a batch of items (nested schema for form-fallback testing).",
+            inputSchema: {
+              type: "object",
+              properties: {
+                items: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: { text: { type: "string" } },
+                  },
+                },
+              },
+              required: ["items"],
+            },
+          },
+          ...syntheticTools,
           ...(extraToolName ? [{
             name: extraToolName,
             title: extraToolTitle || extraToolName,
@@ -472,6 +650,27 @@ function mcpResult(message) {
         ],
       };
     case "tools/call":
+      if (message.params?.name === "mock_batch") {
+        const items = message.params?.arguments?.items;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Received ${Array.isArray(items) ? items.length : 0} items.`,
+            },
+          ],
+        };
+      }
+      if (syntheticTools.some((tool) => tool.name === message.params?.name)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${message.params.name} ok`,
+            },
+          ],
+        };
+      }
       if (errorToolName && message.params?.name === errorToolName) {
         return {
           isError: true,
@@ -536,7 +735,13 @@ function mcpResponse(message) {
   return { jsonrpc: "2.0", id: message.id, result: mcpResult(message) };
 }
 
-async function handleMcp(req, res) {
+async function handleMcp(req, res, entry) {
+  const body = await readJson(req).catch(() => ({}));
+  const messages = Array.isArray(body) ? body : [body];
+  entry.rpcMethods = messages
+    .filter((message) => message && typeof message === "object" && typeof message.method === "string")
+    .map((message) => message.method);
+
   const authorized = isAuthorized(req);
   if (!authorized) {
     json(res, 401, { error: "missing_mcp_token" }, {
@@ -550,29 +755,21 @@ async function handleMcp(req, res) {
     return;
   }
 
-  const body = await readJson(req).catch(() => ({}));
-  const messages = Array.isArray(body) ? body : [body];
-  const entry = requests[requests.length - 1];
-  if (entry) {
-    entry.authorized = authorized;
-    entry.rpcMethods = messages
-      .filter((message) => message && typeof message === "object" && typeof message.method === "string")
-      .map((message) => message.method);
-    entry.toolNames = messages
-      .filter((message) => message && typeof message === "object" && message.method === "tools/call" && typeof message.params?.name === "string")
-      .map((message) => message.params.name);
-    // Arguments + a token fingerprint make the connector the AUTHORITY on who
-    // called it: a spec can prove two members each invoked a tool with their own
-    // credential, without trusting the app's own UI state.
-    entry.tokenId = tokenFingerprint(req);
-    entry.toolCalls = messages
-      .filter((message) => message && typeof message === "object" && message.method === "tools/call" && typeof message.params?.name === "string")
-      .map((message) => ({
-        name: message.params.name,
-        args: message.params.arguments ?? message.params.args ?? {},
-        tokenId: entry.tokenId,
-      }));
-  }
+  entry.authorized = authorized;
+  entry.toolNames = messages
+    .filter((message) => message && typeof message === "object" && message.method === "tools/call" && typeof message.params?.name === "string")
+    .map((message) => message.params.name);
+  // Arguments + a token fingerprint make the connector the AUTHORITY on who
+  // called it: a spec can prove two members each invoked a tool with their own
+  // credential, without trusting the app's own UI state.
+  entry.tokenId = tokenFingerprint(req);
+  entry.toolCalls = messages
+    .filter((message) => message && typeof message === "object" && message.method === "tools/call" && typeof message.params?.name === "string")
+    .map((message) => ({
+      name: message.params.name,
+      args: message.params.arguments ?? message.params.args ?? {},
+      tokenId: entry.tokenId,
+    }));
   const responses = messages.flatMap((message) => {
     if (!message || typeof message !== "object" || message.id === undefined) return [];
     return [mcpResponse(message)];
@@ -604,6 +801,29 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === "/requests") {
       json(res, 200, { requests });
+      return;
+    }
+
+    if (url.pathname === "/admin/agent-workloads" && req.method === "POST") {
+      const body = await readJson(req);
+      agentWorkloads = validateAgentWorkloads(body?.workloads);
+      json(res, 200, { configured: agentWorkloads.length });
+      return;
+    }
+
+    if (url.pathname === "/v1/models" && req.method === "GET") {
+      json(res, 200, {
+        object: "list",
+        data: [{ id: "mock-agent-workload-model", object: "model", owned_by: "openwork-testkit" }],
+      });
+      return;
+    }
+
+    if (
+      req.method === "POST"
+      && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")
+    ) {
+      await handleAgentCompletion(req, res, entry);
       return;
     }
 
@@ -667,7 +887,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/mcp") {
-      await handleMcp(req, res);
+      await handleMcp(req, res, entry);
       return;
     }
 
@@ -741,7 +961,8 @@ const server = http.createServer(async (req, res) => {
 
     json(res, 404, { error: "not_found" });
   } catch (error) {
-    json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    console.error("[mock-oauth-mcp] request failed", error);
+    json(res, 500, { error: "internal_server_error" });
   }
 });
 

@@ -10,9 +10,37 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  classify-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      snapshot_only: ${{ steps.classify.outputs.snapshot_only }}
+    steps:
+      - name: Classify changed files
+        id: classify
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if (context.eventName !== "pull_request") {
+              core.setOutput("snapshot_only", "false")
+              return
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            })
+            const snapshotOnly = files.length === 1
+              && files[0].filename === "ee/apps/inference/src/models/base.json"
+            core.setOutput("snapshot_only", String(snapshotOnly))
+
   openwork-tests:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.snapshot_only != 'true'
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -113,6 +141,8 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
 
       - name: Get pnpm store path
         id: pnpm-store
@@ -135,7 +165,7 @@ jobs:
         run: pnpm --dir evals install --frozen-lockfile --prefer-offline
 
       - name: Run eval spec lane
-        run: pnpm --dir evals run spec
+        run: pnpm --dir evals run test:pr
 
       - name: Run app unit tests
         run: pnpm --filter @openwork/app test
@@ -143,8 +173,14 @@ jobs:
       - name: Run server unit tests
         run: pnpm --filter openwork-server test
 
+      - name: Run Den API unit tests
+        run: pnpm --filter @openwork-ee/den-api test
+
       - name: Run desktop unit tests
         run: pnpm --filter @openwork/desktop test
+
+      - name: Run release script tests
+        run: node --test scripts/release/*.test.mjs
 
       - name: Run eval runner unit tests
         run: pnpm test:eval-runner
@@ -152,8 +188,114 @@ jobs:
       - name: Check outbound access manifest
         run: pnpm check:outbound-access
 
+      # The packaged builds bundle the server plugins with `--target node`,
+      # which resolves workspace packages through their published exports
+      # rather than TypeScript paths. Typechecks and bun tests never take that
+      # route, so an unbuildable import reached dev twice before this ran here.
+      - name: Bundle the server plugins the way packaged builds do
+        run: |
+          set -euo pipefail
+          rm -rf packages/types/dist
+          pnpm --filter openwork-server build
+
       - name: Typecheck Electron main against the IPC contract
         run: pnpm --filter @openwork/desktop typecheck:electron
 
       - name: Run e2e tests
         run: pnpm --filter @openwork/app test:e2e
+
+  validate-models-snapshot:
+    needs: classify-changes
+    if: needs.classify-changes.outputs.snapshot_only == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Validate models snapshot
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises"
+
+          const path = "ee/apps/inference/src/models/base.json"
+          const fail = (message) => { throw new Error(`${path}: ${message}`) }
+          const isRecord = (value) => Boolean(value)
+            && typeof value === "object"
+            && !Array.isArray(value)
+          const isStringArray = (value) => Array.isArray(value)
+            && value.length > 0
+            && value.every((item) => typeof item === "string")
+
+          const parsed = JSON.parse(await readFile(path, "utf8"))
+          if (!isRecord(parsed)) fail("expected a JSON object")
+
+          const providers = Object.entries(parsed)
+          if (providers.length === 0) fail("expected at least one provider")
+
+          for (const [providerId, provider] of providers) {
+            if (!isRecord(provider)) fail(`provider ${providerId} was not an object`)
+            if (provider.id !== providerId) fail(`provider ${providerId} was missing a matching id`)
+            if (typeof provider.name !== "string" || provider.name.length === 0) {
+              fail(`provider ${providerId} was missing a name`)
+            }
+            if (!isRecord(provider.models) || Object.keys(provider.models).length === 0) {
+              fail(`provider ${providerId} did not include models`)
+            }
+
+            for (const [modelId, model] of Object.entries(provider.models)) {
+              if (!isRecord(model)) fail(`model ${providerId}.${modelId} was not an object`)
+              if (model.id !== modelId) fail(`model ${providerId}.${modelId} was missing a matching id`)
+              if (typeof model.name !== "string" || model.name.length === 0) {
+                fail(`model ${providerId}.${modelId} was missing a name`)
+              }
+              if (!isRecord(model.modalities)) {
+                fail(`model ${providerId}.${modelId} was missing modalities`)
+              }
+              if (!isStringArray(model.modalities.input)) {
+                fail(`model ${providerId}.${modelId} was missing input modalities`)
+              }
+              if (!isStringArray(model.modalities.output)) {
+                fail(`model ${providerId}.${modelId} was missing output modalities`)
+              }
+              if (!isRecord(model.limit)) fail(`model ${providerId}.${modelId} was missing limits`)
+            }
+          }
+          NODE
+
+  # Single stable context for branch rulesets to require. Green only when
+  # the lane selected by classification succeeds; always reports.
+  openwork-tests-required:
+    needs: [classify-changes, openwork-tests, validate-models-snapshot]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the selected test lane to pass
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify-changes.result }}
+          SNAPSHOT_ONLY: ${{ needs.classify-changes.outputs.snapshot_only }}
+          TEST_RESULT: ${{ needs.openwork-tests.result }}
+          SNAPSHOT_RESULT: ${{ needs.validate-models-snapshot.result }}
+        run: |
+          echo "classification: $CLASSIFY_RESULT ($SNAPSHOT_ONLY)"
+          echo "openwork-tests: $TEST_RESULT"
+          echo "snapshot validation: $SNAPSHOT_RESULT"
+
+          if [ "$CLASSIFY_RESULT" != "success" ]; then
+            echo "Changed-file classification did not succeed; blocking merge." >&2
+            exit 1
+          fi
+
+          if [ "$SNAPSHOT_ONLY" = "true" ]; then
+            [ "$SNAPSHOT_RESULT" = "success" ] && [ "$TEST_RESULT" = "skipped" ] || exit 1
+          elif [ "$SNAPSHOT_ONLY" = "false" ]; then
+            [ "$TEST_RESULT" = "success" ] && [ "$SNAPSHOT_RESULT" = "skipped" ] || exit 1
+          else
+            echo "Changed-file classification returned an unexpected value; blocking merge." >&2
+            exit 1
+          fi

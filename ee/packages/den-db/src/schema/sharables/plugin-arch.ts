@@ -2,6 +2,7 @@ import { relations, sql } from "drizzle-orm"
 import {
   boolean,
   index,
+  int,
   json,
   mysqlEnum,
   mysqlTable,
@@ -14,7 +15,7 @@ import { denTypeIdColumn, encryptedColumn, encryptedMediumTextColumn } from "../
 import { MemberTable, OrganizationTable } from "../org"
 import { TeamTable } from "../teams"
 
-export const configObjectTypeValues = ["skill", "agent", "command", "tool", "mcp", "hook", "context", "custom"] as const
+export const configObjectTypeValues = ["skill", "agent", "command", "tool", "mcp", "hook", "context", "custom", "script", "workflow", "app"] as const
 export const configObjectSourceModeValues = ["cloud", "import", "connector"] as const
 export const configObjectStatusValues = ["active", "inactive", "deleted", "archived", "ingestion_error"] as const
 export const configObjectCreatedViaValues = ["cloud", "import", "connector", "system"] as const
@@ -102,6 +103,8 @@ export const PluginTable = mysqlTable(
     name: varchar("name", { length: 255 }).notNull(),
     description: text("description"),
     sourceRepositoryUrl: varchar("source_repository_url", { length: 1024 }),
+    sourceFormat: varchar("source_format", { length: 64 }),
+    sourceSchemaVersion: varchar("source_schema_version", { length: 100 }),
     status: mysqlEnum("status", pluginStatusValues).notNull().default("active"),
     createdByOrgMembershipId: denTypeIdColumn("member", "created_by_org_membership_id").notNull(),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
@@ -342,6 +345,7 @@ export const ConnectorTargetTable = mysqlTable(
   (table) => [
     index("connector_target_organization_id").on(table.organizationId),
     index("connector_target_connector_type").on(table.connectorType),
+    index("connector_target_type_created_id").on(table.connectorType, table.createdAt, table.id),
     index("connector_target_target_kind").on(table.targetKind),
     uniqueIndex("connector_target_instance_remote_id").on(table.connectorInstanceId, table.remoteId),
   ],
@@ -387,6 +391,8 @@ export const ConnectorSyncEventTable = mysqlTable(
     externalEventRef: varchar("external_event_ref", { length: 255 }),
     sourceRevisionRef: varchar("source_revision_ref", { length: 255 }),
     status: mysqlEnum("status", connectorSyncStatusValues).notNull().default("pending"),
+    attemptCount: int("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { fsp: 3 }),
     summaryJson: json("summary_json").$type<Record<string, unknown> | null>(),
     startedAt: timestamp("started_at", { fsp: 3 }).notNull().defaultNow(),
     completedAt: timestamp("completed_at", { fsp: 3 }),
@@ -395,8 +401,10 @@ export const ConnectorSyncEventTable = mysqlTable(
     index("connector_sync_event_organization_id").on(table.organizationId),
     index("connector_sync_event_connector_instance_id").on(table.connectorInstanceId),
     index("connector_sync_event_connector_target_id").on(table.connectorTargetId),
+    index("connector_sync_event_target_status").on(table.connectorTargetId, table.status),
     index("connector_sync_event_event_type").on(table.eventType),
     index("connector_sync_event_status").on(table.status),
+    index("connector_sync_event_status_next_attempt_at").on(table.status, table.nextAttemptAt),
     index("connector_sync_event_source_revision_ref").on(table.sourceRevisionRef),
     index("connector_sync_event_external_event_ref").on(table.externalEventRef),
   ],

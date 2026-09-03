@@ -38,6 +38,7 @@ import {
   syncAllWorkspacesRuntimeMcpToEngine,
 } from "./server.js";
 import {
+  writeGlobalRuntimeOpencodeConfig,
   writeRuntimeOpencodeConfig,
   type RuntimeOpencodeConfig,
 } from "./runtime-opencode-config-store.js";
@@ -66,6 +67,7 @@ const DYNAMIC_URL_CANARY = "https://labels.invalid/mcp?access_token=DYNAMIC_URL_
 const DYNAMIC_PATH_CANARY = "/Users/diagnostics/private/mcp.json";
 const execFileAsync = promisify(execFile);
 const nativeFetch = globalThis.fetch;
+const nativeTelemetry = globalThis.__openworkDesktopTelemetry;
 const roots: string[] = [];
 const stops: Array<() => void | Promise<void>> = [];
 
@@ -260,7 +262,18 @@ async function createFixture(options?: {
     logRequests: false,
   };
   if (options?.withRuntime !== false) {
-    await writeRuntimeOpencodeConfig(config, workspace.id, () => options?.runtime ?? diagnosticRuntimeConfig());
+    const runtime = options?.runtime ?? diagnosticRuntimeConfig();
+    await writeRuntimeOpencodeConfig(config, workspace.id, () => runtime);
+    // Plugin specs and the default agent are engine-global: the injected
+    // engine config file is rendered from the ENGINE_GLOBAL row only.
+    const { plugin, default_agent: defaultAgent } = runtime;
+    if (plugin !== undefined || defaultAgent !== undefined) {
+      await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
+        ...current,
+        ...(plugin !== undefined ? { plugin } : {}),
+        ...(defaultAgent !== undefined ? { default_agent: defaultAgent } : {}),
+      }));
+    }
   }
   return { root, workspaceRoot, workspace, config };
 }
@@ -488,10 +501,12 @@ async function snapshotTree(root: string): Promise<Record<string, string>> {
 
 beforeEach(() => {
   globalThis.fetch = nativeFetch;
+  globalThis.__openworkDesktopTelemetry = nativeTelemetry;
 });
 
 afterEach(async () => {
   globalThis.fetch = nativeFetch;
+  globalThis.__openworkDesktopTelemetry = nativeTelemetry;
   while (stops.length) await stops.pop()?.();
   while (roots.length) await rm(roots.pop()!, { recursive: true, force: true });
 });
@@ -525,6 +540,7 @@ describe("classifyEngineMcpTransportCause", () => {
 describe("agent context diagnostics analyzer", () => {
   test("mirrors Connect's health-first steering priority", () => {
     const snapshot = {
+      status: "available",
       connectEnabled: false,
       connectCatalogEnabled: false,
       cloudMcpPresent: false,
@@ -894,6 +910,7 @@ describe("agent context diagnostics analyzer", () => {
     });
 
     const firstRun = await run();
+    expect(firstRun.connect).toMatchObject({ stateStatus: "missing", connectEnabled: false });
     expect(checkById(firstRun, "connect-steering-scope")).toMatchObject({
       status: "passed",
       details: { connectStateStatus: "missing", connectEnabled: false },
@@ -901,12 +918,50 @@ describe("agent context diagnostics analyzer", () => {
 
     await writeFile(join(fixture.root, "state", "connect-state.json"), "{not valid json", "utf8");
     const corrupt = await run();
+    expect(corrupt.connect).toMatchObject({ stateStatus: "invalid", connectEnabled: false });
     expect(checkById(corrupt, "connect-steering-scope")).toMatchObject({
       status: "warning",
       evidenceKind: "unavailable",
       code: "connect_state_unavailable",
       owner: "openwork-server",
       details: { connectStateStatus: "invalid" },
+    });
+  });
+
+  test("surfaces managed MCP vault recovery evidence without decrypting the vault", async () => {
+    const fixture = await createFixture();
+    const run = () => runAgentContextDiagnostics({
+      config: fixture.config,
+      workspace: fixture.workspace,
+      request: emptyObservedRequest,
+      inspectRegistration: () => "connected" as const,
+    });
+
+    const fresh = await run();
+    expect(checkById(fresh, "workspace-runtime")).toMatchObject({
+      details: {
+        managedMcpVaultStatus: "absent",
+        managedMcpVaultRecoveredAt: null,
+        managedMcpVaultQuarantinedTo: null,
+      },
+    });
+
+    fixture.config.localManagedMcpVaultKey = async () => new Uint8Array(32);
+    const quarantinedTo = "local-managed-mcp-vault.json.openwork-backup-20260815094500";
+    await writeFile(join(fixture.root, "state", "local-managed-mcp-vault.json"), JSON.stringify({
+      schemaVersion: 2,
+      index: {},
+      vault: { schemaVersion: 1, algorithm: "aes-256-gcm", iv: "AAAA", tag: "AAAA", data: "AAAA" },
+      lastRecovery: { at: 1_755_000_000_000, reason: "secure_storage_changed", quarantinedTo },
+    }), "utf8");
+
+    const recovered = await run();
+    expect(checkById(recovered, "workspace-runtime")).toMatchObject({
+      details: {
+        managedMcpVaultStatus: "recovered",
+        managedMcpVaultRecoveredAt: 1_755_000_000_000,
+        managedMcpVaultQuarantinedTo: quarantinedTo,
+      },
     });
   });
 
@@ -1030,7 +1085,12 @@ describe("agent context diagnostics analyzer", () => {
       "https://den.customer.example/custom/mcp/agent",
       "https://den.customer.example/custom/mcp/agent",
     ]);
-    expect(fetchCalls.some((call) => call.url.includes("openworklabs.com"))).toBe(false);
+    const openWorkHostedOrigins = new Set([
+      "https://openworklabs.com",
+      "https://api.openworklabs.com",
+      "https://app.openworklabs.com",
+    ]);
+    expect(fetchCalls.some((call) => openWorkHostedOrigins.has(new URL(call.url).origin))).toBe(false);
     expect(report.mcps).toContainEqual(expect.objectContaining({
       name: "openwork-cloud",
       source: "config.remote",
@@ -1193,7 +1253,7 @@ describe("agent context diagnostics analyzer", () => {
       dependencies: {
         fetchImpl: catalogFetch(["search_capabilities", "execute_capability"], []),
         inspectEffectiveEngine: effectiveEngineInspection(diagnosticRuntimeConfig(), {
-          prompt: "search_capabilities execute_capability Memory Bank",
+          prompt: "search_capabilities execute_capability ## OpenWork Artifacts",
         }),
       },
     });
@@ -1204,7 +1264,7 @@ describe("agent context diagnostics analyzer", () => {
       details: {
         searchCapabilities: true,
         executeCapability: true,
-        memoryBank: true,
+        artifacts: true,
         canonicalPromptDigestMatch: false,
       },
     });
@@ -2030,6 +2090,50 @@ describe("agent context diagnostics route", () => {
       code: "engine_diagnostics_request_failed",
     });
     expect(await snapshotTree(fixture.root)).toEqual(before);
+  });
+
+  test.serial("types the server-owned diagnostics deadline without capturing it", async () => {
+    const previousTimeout = process.env.OPENWORK_AGENT_DIAGNOSTICS_TIMEOUT_MS;
+    process.env.OPENWORK_AGENT_DIAGNOSTICS_TIMEOUT_MS = "50";
+    const fixture = await createFixture({
+      withRuntime: false,
+      workspace: { id: "ws_agent_diagnostics_server_timeout" },
+    });
+    const base = await startOpenwork(fixture.config);
+    const captured: unknown[] = [];
+    globalThis.__openworkDesktopTelemetry = {
+      captureException(error) {
+        captured.push(error);
+        return true;
+      },
+    };
+    globalThis.fetch = Object.assign(
+      (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const signal = input instanceof Request ? input.signal : init?.signal;
+        if (!signal) return Promise.reject(new Error("Expected diagnostics fetch signal"));
+        return new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(signal.reason);
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        });
+      },
+      { preconnect: nativeFetch.preconnect },
+    );
+
+    try {
+      const response = await nativeFetch(`${base}/workspace/${fixture.workspace.id}/diagnostics/agent-context`, {
+        method: "POST",
+        headers: clientHeaders(),
+        body: JSON.stringify(emptyObservedRequest),
+      });
+
+      expect(response.status).toBe(504);
+      expect(await response.json()).toMatchObject({ code: "agent_diagnostics_timeout" });
+      expect(captured).toEqual([]);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.OPENWORK_AGENT_DIAGNOSTICS_TIMEOUT_MS;
+      else process.env.OPENWORK_AGENT_DIAGNOSTICS_TIMEOUT_MS = previousTimeout;
+    }
   });
 
   test("rejects a viewer before diagnostics or any downstream fetch", async () => {

@@ -72,6 +72,7 @@ export const connectorSyncStatusSchema = z.enum(connectorSyncStatusValues)
 export const connectorSyncEventTypeSchema = z.enum(connectorSyncEventTypeValues)
 export const githubWebhookEventSchema = z.enum(githubWebhookEventValues)
 export const extensionSourceFormatSchema = z.enum([
+  "agent-plugin",
   "openwork-builtin",
   "openwork-extension-manifest",
   "claude-plugin",
@@ -218,9 +219,33 @@ export const resourceAccessGrantWriteSchema = z.object({
   }
 })
 
+/**
+ * The same connector setup an admin fills in on the Connections page. It
+ * configures the connection for a plugin-declared MCP server, either inline
+ * while creating the plugin or later through the configure route.
+ */
+export const pluginMcpConnectionSetupSchema = z.object({
+  authType: z.enum(["oauth", "apikey", "none"]).optional().default("oauth"),
+  credentialMode: z.enum(["shared", "per_member"]).optional(),
+  apiKey: z.string().trim().min(1).max(4096).optional(),
+  oauthClient: z.object({
+    clientId: z.string().trim().min(1).max(512),
+    clientSecret: z.string().trim().min(1).max(4096).optional(),
+  }).optional(),
+})
+
 export const pluginCreateComponentSchema = z.object({
   type: configObjectTypeSchema,
   input: configObjectInputSchema,
+  connection: pluginMcpConnectionSetupSchema.optional(),
+}).superRefine((value, ctx) => {
+  if (value.connection && value.type !== "mcp") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "connection is only allowed on mcp components.",
+      path: ["connection"],
+    })
+  }
 })
 
 export const pluginCreateSchema = z.object({
@@ -423,16 +448,9 @@ export const githubPluginMcpImportSchema = githubPluginMcpImportPreviewSchema.ex
   selectedServerNames: z.array(z.string().trim().min(1).max(255)).max(200).optional(),
 })
 
-export const pluginMcpRequirementConfigureSchema = z.object({
+export const pluginMcpRequirementConfigureSchema = pluginMcpConnectionSetupSchema.extend({
   configObjectId: configObjectIdSchema,
   serverName: z.string().trim().min(1).max(255),
-  authType: z.enum(["oauth", "apikey", "none"]).optional().default("oauth"),
-  credentialMode: z.enum(["shared", "per_member"]).optional(),
-  apiKey: z.string().trim().min(1).max(4096).optional(),
-  oauthClient: z.object({
-    clientId: z.string().trim().min(1).max(512),
-    clientSecret: z.string().trim().min(1).max(4096).optional(),
-  }).optional(),
 })
 
 export const githubDiscoveryTreeQuerySchema = z.object({
@@ -539,6 +557,19 @@ export const libraryItemSchema = z.discriminatedUnion("type", [
     role: accessRoleSchema,
   }),
   z.object({
+    type: z.literal("app"),
+    id: configObjectIdSchema,
+    pluginId: pluginIdSchema,
+    name: z.string().trim().min(1).max(255),
+    description: nullableStringSchema,
+    sourceUrl: z.string().url().max(2048),
+    status: z.enum(["active", "retired"]),
+    activeVersionId: configObjectVersionIdSchema.nullable(),
+    state: z.literal("ready"),
+    edges: z.array(effectiveAccessEdgeSchema),
+    role: accessRoleSchema,
+  }),
+  z.object({
     type: z.literal("connection"),
     id: z.string().trim().min(1),
     name: z.string().trim().min(1).max(255),
@@ -549,6 +580,26 @@ export const libraryItemSchema = z.discriminatedUnion("type", [
     state: z.enum(["connected", "needs_signin", "needs_admin_setup", "available"]),
     connectedAt: nullableTimestampSchema,
     edges: z.array(effectiveAccessEdgeSchema),
+  }),
+  z.object({
+    type: z.literal("workflow"),
+    id: configObjectIdSchema,
+    plugin: z.object({ id: pluginIdSchema, name: z.string().trim().min(1).max(255) }).nullable(),
+    name: z.string().trim().min(1).max(255),
+    description: nullableStringSchema,
+    role: accessRoleSchema,
+    edges: z.array(effectiveAccessEdgeSchema),
+    state: z.enum(["ready", "needs_signin", "needs_admin_setup"]),
+    resultState: z.enum(["never_run", "fresh", "stale", "needs_attention"]),
+    latestSuccessfulAt: nullableTimestampSchema,
+    viewState: z.enum(["default", "custom_active", "build_failed", "retired"]),
+    activeViewTitle: nullableStringSchema,
+    automationCount: z.number().int().nonnegative(),
+    source: z.object({
+      kind: z.enum(["created", "installed_template"]),
+      templateName: z.string().trim().min(1).max(255).optional(),
+      templateVersion: z.string().trim().min(1).max(100).optional(),
+    }),
   }),
 ]).meta({ ref: "PluginArchLibraryItem" })
 
@@ -633,6 +684,8 @@ export const pluginSchema = z.object({
   name: z.string().trim().min(1).max(255),
   description: nullableStringSchema,
   sourceRepositoryUrl: z.string().trim().min(1).max(1024).nullable(),
+  sourceFormat: extensionSourceFormatSchema.nullable(),
+  sourceSchemaVersion: z.string().trim().min(1).max(100).nullable(),
   status: pluginStatusSchema,
   createdByOrgMembershipId: memberIdSchema,
   createdAt: z.string().datetime({ offset: true }),
@@ -761,6 +814,7 @@ export const connectorSyncSummarySchema = z.object({
 
 export const connectorSyncEventSchema = z.object({
   id: connectorSyncEventIdSchema,
+  attemptCount: z.number().int().nonnegative(),
   connectorInstanceId: connectorInstanceIdSchema,
   connectorTargetId: connectorTargetIdSchema.nullable(),
   connectorType: connectorTypeSchema,
@@ -768,6 +822,7 @@ export const connectorSyncEventSchema = z.object({
   eventType: connectorSyncEventTypeSchema,
   externalEventRef: z.string().trim().min(1).max(255).nullable(),
   sourceRevisionRef: z.string().trim().min(1).max(255).nullable(),
+  nextAttemptAt: nullableTimestampSchema,
   status: connectorSyncStatusSchema,
   summaryJson: connectorSyncSummarySchema.nullable(),
   startedAt: z.string().datetime({ offset: true }),
@@ -938,7 +993,8 @@ const githubPluginMcpImportServerSchema = z.object({
   pluginKey: z.string(),
   pluginName: z.string(),
   serverKey: z.string(),
-  skippedReason: z.enum(["missing_url", "local_unsupported", "invalid_url", "unsupported_auth"]).nullable(),
+  skippedReason: z.enum(["headers_unsupported", "invalid_config", "invalid_url", "local_unsupported", "missing_url", "unsupported_auth"]).nullable(),
+  sourceSchemaVersion: z.string().nullable(),
   sourcePath: z.string(),
   supported: z.boolean(),
   url: z.string().nullable(),
@@ -946,7 +1002,7 @@ const githubPluginMcpImportServerSchema = z.object({
 
 const githubPluginMcpImportPlanSchema = z.object({
   branch: z.string(),
-  classification: z.enum(["claude_marketplace_repo", "claude_multi_plugin_repo", "claude_single_plugin_repo", "folder_inferred_repo", "unsupported"]),
+  classification: z.enum(["agent_plugin_repo", "claude_marketplace_repo", "claude_multi_plugin_repo", "claude_single_plugin_repo", "folder_inferred_repo", "unsupported"]),
   marketplace: z.object({
     description: z.string().nullable(),
     name: z.string().nullable(),
@@ -970,9 +1026,11 @@ const githubPluginMcpImportPlanSchema = z.object({
     pluginName: z.string(),
     skillKey: z.string(),
     skippedReason: z.enum(["invalid_skill"]).nullable(),
+    sourceSchemaVersion: z.string().nullable(),
     sourcePath: z.string(),
     supported: z.boolean(),
   })),
+  sourceSchemaVersion: z.string().nullable(),
   sourceRevisionRef: z.string(),
   warnings: z.array(z.string()),
 }).meta({ ref: "GithubPluginMcpImportPlan" })
@@ -999,7 +1057,7 @@ export const githubPluginMcpImportResponseSchema = pluginArchMutationResponseSch
     plugin: pluginSchema,
     skipped: z.array(z.object({
       name: z.string(),
-      reason: z.enum(["missing_url", "local_unsupported", "invalid_url", "unsupported_auth"]),
+      reason: z.enum(["headers_unsupported", "invalid_config", "invalid_url", "local_unsupported", "missing_url", "unsupported_auth"]),
     })),
     skippedSkills: z.array(z.object({
       name: z.string(),
@@ -1080,6 +1138,10 @@ export const connectorInstanceRemoveResponseSchema = pluginArchMutationResponseS
 export const connectorInstanceListResponseSchema = pluginArchListResponseSchema("PluginArchConnectorInstanceListResponse", connectorInstanceSchema)
 export const connectorInstanceDetailResponseSchema = pluginArchDetailResponseSchema("PluginArchConnectorInstanceDetailResponse", connectorInstanceSchema)
 export const connectorInstanceMutationResponseSchema = pluginArchMutationResponseSchema("PluginArchConnectorInstanceMutationResponse", connectorInstanceSchema)
+export const connectorInstanceSyncNowResponseSchema = pluginArchMutationResponseSchema(
+  "PluginArchConnectorInstanceSyncNowResponse",
+  z.object({ enqueuedCount: z.number().int().nonnegative() }),
+)
 export const connectorTargetListResponseSchema = pluginArchListResponseSchema("PluginArchConnectorTargetListResponse", connectorTargetSchema)
 export const connectorTargetDetailResponseSchema = pluginArchDetailResponseSchema("PluginArchConnectorTargetDetailResponse", connectorTargetSchema)
 export const connectorTargetMutationResponseSchema = pluginArchMutationResponseSchema("PluginArchConnectorTargetMutationResponse", connectorTargetSchema)
@@ -1096,7 +1158,7 @@ export const githubRepositorySchema = z.object({
   fullName: z.string().trim().min(1),
   defaultBranch: z.string().trim().min(1).nullable(),
   hasPluginManifest: z.boolean().optional(),
-  manifestKind: z.enum(["marketplace", "plugin"]).nullable().optional(),
+  manifestKind: z.enum(["agent-plugin", "marketplace", "plugin"]).nullable().optional(),
   marketplacePluginCount: z.number().int().nonnegative().nullable().optional(),
   private: z.boolean(),
 }).meta({ ref: "PluginArchGithubRepository" })
@@ -1113,7 +1175,8 @@ export const githubDiscoveryTreeSummarySchema = z.object({
 }).meta({ ref: "PluginArchGithubDiscoveryTreeSummary" })
 export const githubDiscoveredPluginSchema = z.object({
   key: z.string().trim().min(1),
-  sourceKind: z.enum(["marketplace_entry", "plugin_manifest", "standalone_claude", "folder_inference"]),
+  sourceKind: z.enum(["agent_plugin_manifest", "marketplace_entry", "plugin_manifest", "standalone_claude", "folder_inference"]),
+  sourceSchemaVersion: z.enum(["1.0.0", "1.1.0"]).nullable(),
   rootPath: z.string(),
   displayName: z.string().trim().min(1),
   description: nullableStringSchema,
@@ -1138,7 +1201,7 @@ export const githubConnectorDiscoveryResponseSchema = pluginArchMutationResponse
   "PluginArchGithubConnectorDiscoveryResponse",
   z.object({
     autoImportNewPlugins: z.boolean(),
-    classification: z.enum(["claude_marketplace_repo", "claude_multi_plugin_repo", "claude_single_plugin_repo", "folder_inferred_repo", "unsupported"]),
+    classification: z.enum(["agent_plugin_repo", "claude_marketplace_repo", "claude_multi_plugin_repo", "claude_single_plugin_repo", "folder_inferred_repo", "unsupported"]),
     connectorInstance: connectorInstanceSchema,
     connectorTarget: connectorTargetSchema,
     discoveredPlugins: z.array(githubDiscoveredPluginSchema),

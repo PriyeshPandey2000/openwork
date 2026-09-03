@@ -1,26 +1,31 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { DenCloudInstance } from "../src/app/lib/den";
+import { DenApiError, type DenCloudInstance } from "../src/app/lib/den";
 import {
   CloudWorkspaceBootTakeover,
   CloudWorkspaceOverlay,
   CloudWorkspaceStatusContext,
   CloudWorkspaceStatusPanel,
+  cloudWorkspaceRequestFailureLogFields,
 } from "../src/react-app/shell/cloud-workspace-overlay";
 import {
   CLOUD_WORKSPACE_SLOW_BOOT_MS,
   cloudWorkspaceBootIsSlow,
   cloudWorkspaceBootStages,
+  cloudWorkspaceFailureLogFields,
   cloudWorkspaceStatusHasReadyContent,
   cloudWorkspaceTakeoverCopy,
   cloudWorkspaceUpdateAvailable,
   formatCloudWorkspaceElapsed,
   mapCloudWorkspaceMainContentDecision,
   mapCloudWorkspaceState,
+  shouldShowCloudWorkspaceStatusPill,
   shouldRefetchCloudWorkspaceOnReadyTransition,
+  shouldSuppressBootOverlayForGateway,
 } from "../src/react-app/shell/cloud-workspace-status";
 import type { CloudWorkspaceMainContentDecision, CloudWorkspacePillVariant } from "../src/react-app/shell/cloud-workspace-status";
+import { BootStateProvider } from "../src/react-app/shell/boot-state";
 
 const originalWindow = globalThis.window;
 
@@ -35,7 +40,27 @@ function instance(input: Partial<DenCloudInstance> = {}): DenCloudInstance {
 }
 
 describe("cloud workspace overlay state", () => {
-  test("maps ready and current workers to the quiet Cloud pill", () => {
+  test("formats safe browser diagnostics without raw response details", () => {
+    expect(cloudWorkspaceFailureLogFields({
+      code: "runtime_health_timeout",
+      stage: "recovery",
+      reference: "cwf_test",
+      occurredAt: "2026-08-28T12:00:00.000Z",
+    })).toEqual({
+      failure_code: "runtime_health_timeout",
+      failure_stage: "recovery",
+      failure_reference: "cwf_test",
+      failure_occurred_at: "2026-08-28T12:00:00.000Z",
+    });
+    expect(cloudWorkspaceRequestFailureLogFields(new DenApiError(
+      503,
+      "workspace_not_ready",
+      "raw response with Bearer secret",
+      { token: "secret" },
+    ))).toEqual({ failure_code: "workspace_not_ready", http_status: 503 });
+  });
+
+  test("maps ready and current workers to a quiet status", () => {
     const state = mapCloudWorkspaceState({ instance: instance(), updating: false });
 
     expect(state.variant).toBe("ready");
@@ -87,9 +112,27 @@ describe("cloud workspace overlay state", () => {
     expect(failed.tone).toBe("amber");
     expect(failed.label).toBe("Workspace needs attention");
     expect(failed.showRetry).toBe(true);
+
+    const unavailable = mapCloudWorkspaceState({ instance: null, updating: false, requestFailed: true });
+    expect(unavailable.variant).toBe("unavailable");
+    expect(unavailable.label).toBe("Couldn’t check workspace");
+    expect(unavailable.statusLine).toBe("Couldn’t check workspace status");
+    expect(cloudWorkspaceTakeoverCopy({ variant: unavailable.variant, slow: false }).body)
+      .toContain("sandbox may still be running");
   });
 
-  test("keeps the pill in updating state after the user clicks update", () => {
+  test("shows the corner pill only for resolved degraded states", () => {
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "waking", hasInstance: false, requestFailed: false })).toBe(false);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "waking", hasInstance: true, requestFailed: false })).toBe(true);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "provisioning", hasInstance: true, requestFailed: false })).toBe(true);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "failed", hasInstance: false, requestFailed: true })).toBe(true);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "unavailable", hasInstance: false, requestFailed: true })).toBe(true);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "ready", hasInstance: true, requestFailed: false })).toBe(false);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "stale", hasInstance: true, requestFailed: false })).toBe(false);
+    expect(shouldShowCloudWorkspaceStatusPill({ variant: "updating", hasInstance: true, requestFailed: false })).toBe(false);
+  });
+
+  test("keeps the workspace status updating after the user clicks update", () => {
     const state = mapCloudWorkspaceState({
       instance: instance({ imageVersion: "openwork-0.18.2", latestVersion: "openwork-0.18.8" }),
       updating: true,
@@ -108,6 +151,7 @@ describe("cloud workspace overlay state", () => {
       ["waking", "takeover"],
       ["provisioning", "takeover"],
       ["updating", "takeover"],
+      ["unavailable", "takeover"],
       ["failed", "takeover"],
     ];
     const withReadyContent: [CloudWorkspacePillVariant, CloudWorkspaceMainContentDecision][] = [
@@ -116,6 +160,7 @@ describe("cloud workspace overlay state", () => {
       ["waking", "content"],
       ["provisioning", "content"],
       ["updating", "content"],
+      ["unavailable", "content"],
       ["failed", "takeover"],
     ];
 
@@ -128,7 +173,7 @@ describe("cloud workspace overlay state", () => {
   });
 
   test("passes all cloud states through outside gateway mode", () => {
-    const statuses: CloudWorkspacePillVariant[] = ["ready", "stale", "waking", "provisioning", "updating", "failed"];
+    const statuses: CloudWorkspacePillVariant[] = ["ready", "stale", "waking", "provisioning", "updating", "unavailable", "failed"];
 
     for (const status of statuses) {
       expect(mapCloudWorkspaceMainContentDecision({ status, hasWorkspaces: false, gatewayMode: false })).toBe("content");
@@ -137,7 +182,7 @@ describe("cloud workspace overlay state", () => {
   });
 
   test("does not allow not-found errors before a gateway worker is ready", () => {
-    const notReady: CloudWorkspacePillVariant[] = ["waking", "provisioning", "updating", "failed"];
+    const notReady: CloudWorkspacePillVariant[] = ["waking", "provisioning", "updating", "unavailable", "failed"];
 
     for (const status of notReady) {
       expect(cloudWorkspaceStatusHasReadyContent(status)).toBe(false);
@@ -223,7 +268,7 @@ describe("cloud workspace slow boot escalation", () => {
 
     expect(early.title).toBe("Starting your workspace…");
     expect(late.title).toBe("Still working on it…");
-    expect(late.body).toContain("Nothing is broken");
+    expect(late.body).toContain("check again");
   });
 
   test("keeps the failure message even when the wait has gone long", () => {
@@ -239,7 +284,7 @@ describe("cloud workspace slow boot escalation", () => {
   });
 });
 
-function renderTakeover(status: DenCloudInstance["status"]) {
+function renderTakeover(status: DenCloudInstance["status"], retrying = false) {
   const viewModel = mapCloudWorkspaceState({ instance: instance({ status }), updating: false });
 
   return renderToStaticMarkup(
@@ -250,8 +295,10 @@ function renderTakeover(status: DenCloudInstance["status"]) {
         instance: instance({ status }),
         requestFailed: false,
         updating: false,
+        retrying,
         viewModel,
         refresh: async () => {},
+        retry: async () => {},
         signOut: () => {},
         updateNow: () => {},
         takeoverActive: true,
@@ -289,6 +336,35 @@ describe("cloud workspace boot takeover", () => {
     expect(html).not.toContain("animate-pulse");
   });
 
+  test("keeps a single wait indicator on the takeover card", () => {
+    const html = renderTakeover("provisioning");
+    // One 3x3 ticker lives in the header; checkpoints use a static dot.
+    expect(html.split("ow-dot-ticker").length - 1).toBe(9);
+  });
+
+  test("does not stack the generic boot overlay on top of the gateway takeover", () => {
+    expect(shouldSuppressBootOverlayForGateway({
+      gatewayMode: true,
+      signedIn: true,
+      variant: "provisioning",
+    })).toBe(true);
+    expect(shouldSuppressBootOverlayForGateway({
+      gatewayMode: true,
+      signedIn: true,
+      variant: "waking",
+    })).toBe(true);
+    expect(shouldSuppressBootOverlayForGateway({
+      gatewayMode: true,
+      signedIn: true,
+      variant: "ready",
+    })).toBe(false);
+    expect(shouldSuppressBootOverlayForGateway({
+      gatewayMode: false,
+      signedIn: true,
+      variant: "waking",
+    })).toBe(false);
+  });
+
   test("keeps the wait calm until the promised minute is at risk", () => {
     const html = renderTakeover("waking");
 
@@ -304,6 +380,13 @@ describe("cloud workspace boot takeover", () => {
     expect(html).toContain("Workspace needs attention");
     expect(html).toContain("Retry");
     expect(html).toContain("Sign out");
+  });
+
+  test("disables repeated recovery requests while retry is already in flight", () => {
+    const html = renderTakeover("failed", true);
+
+    expect(html).toContain("Retrying…");
+    expect(html).toContain("disabled");
   });
 });
 
@@ -321,7 +404,11 @@ describe("cloud workspace overlay gateway gating", () => {
       value: { location: { origin: "https://instance.example.test" } },
     });
 
-    expect(renderToStaticMarkup(<CloudWorkspaceOverlay />)).toBe("");
+    expect(renderToStaticMarkup(
+      <BootStateProvider>
+        <CloudWorkspaceOverlay />
+      </BootStateProvider>,
+    )).toBe("");
   });
 });
 
@@ -336,7 +423,9 @@ describe("cloud workspace overlay diagnostics", () => {
       <CloudWorkspaceStatusPanel
         viewModel={viewModel}
         updating={false}
+        retrying={false}
         onRefresh={() => {}}
+        onRetry={() => {}}
         onSignOut={() => {}}
         onUpdateNow={() => {}}
       />,
@@ -353,7 +442,9 @@ describe("cloud workspace overlay diagnostics", () => {
       <CloudWorkspaceStatusPanel
         viewModel={viewModel}
         updating={false}
+        retrying={false}
         onRefresh={() => {}}
+        onRetry={() => {}}
         onSignOut={() => {}}
         onUpdateNow={() => {}}
       />,

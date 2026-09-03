@@ -48,6 +48,7 @@ import {
   connectorInstanceListQuerySchema,
   connectorInstanceListResponseSchema,
   connectorInstanceMutationResponseSchema,
+  connectorInstanceSyncNowResponseSchema,
   connectorInstanceParamsSchema,
   connectorInstanceUpdateSchema,
   connectorMappingCreateSchema,
@@ -115,6 +116,7 @@ import { isPluginArchOrgAdmin, requirePluginArchCapability, type PluginArchActor
 import { pluginArchRoutePaths } from "./contracts.js"
 import { ensureOrganizationAdmin, orgAccessFailureStatus } from "../shared.js"
 import { isAgentOAuthClientConnection, listMemberUsableConnectionFacts } from "../mcp-connections.js"
+import { listWorkflowLibraryItems } from "../../../workflow-library.js"
 import {
   PluginArchRouteFailure,
   addPluginMembership,
@@ -177,6 +179,7 @@ import {
   removePluginFromMarketplace,
   removePluginMembership,
   retryConnectorSyncEvent,
+  syncConnectorInstanceNow,
   setConfigObjectLifecycle,
   setConnectorInstanceLifecycle,
   setMarketplaceLifecycle,
@@ -221,6 +224,7 @@ function actorContext(c: OrgContext): PluginArchActorContext {
   }
 
   return {
+    ...(c.get("apiKey") ? { apiKey: true } : {}),
     memberTeams: c.get("memberTeams") ?? [],
     organizationContext,
     session: c.get("session"),
@@ -386,7 +390,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        await requirePluginArchCapability(context, "config_object.create")
+        await requirePluginArchCapability(context, "config_object.create", false)
         const body = validJson<any>(c)
         const item = await createConfigObject({
           context,
@@ -707,7 +711,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Create plugin",
-      description: "Creates a plugin and can also create components, share org-wide, and publish to a marketplace in one request.",
+      description: "Creates a plugin and can also create components, share org-wide, and publish to a marketplace in one request. An mcp component may carry the same connection setup as the Connections page (authentication, credential mode, API key, OAuth app) so its server is configured immediately; owners and admins only.",
       responses: {
         201: jsonResponse("Plugin created successfully.", pluginMutationResponseSchema),
         400: jsonResponse("The plugin creation request was invalid.", invalidRequestSchema),
@@ -719,18 +723,26 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        await requirePluginArchCapability(context, "plugin.create")
         const body = validJson<PluginCreateBody>(c)
+        await requirePluginArchCapability(context, "plugin.create", body.orgWide === true || Boolean(body.marketplaceId))
         if (body.orgWide === true && !isPluginArchOrgAdmin(context)) {
           throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can create org-wide plugins.")
         }
         if ((body.components?.length ?? 0) > 0) {
-          await requirePluginArchCapability(context, "config_object.create")
+          await requirePluginArchCapability(context, "config_object.create", false)
+        }
+        const sessionId = c.get("session")?.id
+        if (body.components?.some((component) => component.connection && isAgentPluginMcpSecretSetup({
+          apiKey: component.connection.apiKey,
+          oauthClient: component.connection.oauthClient,
+          sessionId,
+        }))) {
+          return c.json({ error: "invalid_request", message: "Plugin MCP credentials cannot be set from the agent. Add them in the OpenWork Cloud dashboard under Connections." }, 400)
         }
         return c.json({
           ok: true,
           item: await createPluginBundle({
-            components: body.components?.map((component) => ({ type: component.type, value: component.input })),
+            components: body.components?.map((component) => ({ connection: component.connection, type: component.type, value: component.input })),
             context,
             description: body.description,
             marketplaceId: body.marketplaceId,
@@ -844,7 +856,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Add plugin config object",
-      description: "Adds a config object to a plugin.",
+      description: "Adds a config object to a plugin. Workflows require manager access because this can expand their audience through Plugin and Marketplace grants.",
       responses: {
         201: jsonResponse("Plugin membership created successfully.", pluginMembershipMutationResponseSchema),
         400: jsonResponse("The plugin membership request was invalid.", invalidRequestSchema),
@@ -868,7 +880,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Remove plugin config object",
-      description: "Removes one config object from a plugin.",
+      description: "Removes one config object from a plugin. Workflows require manager access because this revokes inherited Plugin or Marketplace access.",
       responses: {
         204: emptyResponse("Plugin membership removed successfully."),
         400: jsonResponse("The plugin membership path parameters were invalid.", invalidRequestSchema),
@@ -903,7 +915,13 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const params = validParam<any>(c)
-        return c.json(await listPluginMemberships({ context: actorContext(c), includeConfigObjects: true, onlyActive: true, pluginId: params.pluginId }))
+        return c.json(await listPluginMemberships({
+          context: actorContext(c),
+          includeConfigObjects: true,
+          legacyWorkflowObjectType: true,
+          onlyActive: true,
+          pluginId: params.pluginId,
+        }))
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -1032,7 +1050,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "List my library",
-      description: "Lists the active plugins and connections the caller can use, with every applicable access edge.",
+      description: "Lists the Workflows, Remote MCP Apps, plugins, and connections the caller can use, with every applicable access edge. Workflows and Remote MCP Apps remain config objects contained by their parent OpenWork Connect Plugin.",
       responses: {
         200: jsonResponse("Effective member library returned successfully.", meLibraryListResponseSchema),
         401: jsonResponse("The caller must be signed in to view their library.", unauthorizedSchema),
@@ -1041,12 +1059,13 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        const [pluginItems, connections] = await Promise.all([
+        const [pluginItems, connections, workflowItems] = await Promise.all([
           listMeLibraryPluginItems({ context }),
           listMemberUsableConnectionFacts({ context }),
+          listWorkflowLibraryItems({ context }),
         ])
         const connectionItems = await listMeLibraryConnectionItems({ connections, context })
-        const items = [...pluginItems, ...connectionItems]
+        const items = [...pluginItems, ...connectionItems, ...workflowItems]
         items.sort((left, right) => {
           const byName = left.name.localeCompare(right.name)
           return byName !== 0 ? byName : left.id.localeCompare(right.id)
@@ -1684,6 +1703,35 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
         const params = validParam<any>(c)
         const body = validJson<any>(c)
         return c.json({ ok: true, item: await setConnectorInstanceAutoImport({ autoImportNewPlugins: Boolean(body.autoImportNewPlugins), connectorInstanceId: params.connectorInstanceId, context }) })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "post", pluginArchRoutePaths.connectorInstanceSyncNow,
+    paramValidator(connectorInstanceParamsSchema),
+    describeRoute({
+      tags: ["Connectors"],
+      summary: "Sync connector instance now",
+      description: "Queues sync work for each connector target without sync work already queued or running.",
+      responses: {
+        200: jsonResponse("Connector instance sync queued successfully.", connectorInstanceSyncNowResponseSchema),
+        400: jsonResponse("The connector instance path parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to sync connector instances.", unauthorizedSchema),
+        403: jsonResponse("The caller lacks permission to edit this connector instance.", forbiddenSchema),
+        404: jsonResponse("The connector instance could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const item = await syncConnectorInstanceNow({
+          connectorInstanceId: normalizeDenTypeId(
+            "connectorInstance",
+            validParam<z.infer<typeof connectorInstanceParamsSchema>>(c).connectorInstanceId,
+          ),
+          context: actorContext(c),
+        })
+        return c.json({ ok: true, item }, 200)
       } catch (error) {
         return routeErrorResponse(c, error)
       }

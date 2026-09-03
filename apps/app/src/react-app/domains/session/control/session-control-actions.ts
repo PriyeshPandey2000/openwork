@@ -3,11 +3,13 @@ import { useCallback, useMemo } from "react";
 
 import type { createClient } from "../../../../app/lib/opencode";
 import type { OpenworkServerClient, OpenworkWorkspaceInfo } from "../../../../app/lib/openwork-server";
+import { deleteNativeSession } from "../../../../app/lib/opencode-session-native";
 import { setSessionArchived } from "../../../../app/lib/opencode-session";
+import type { ResolvedWorkspaceEndpoint } from "../../../../app/lib/workspace-endpoint";
 import { getDisplaySessionTitle } from "../../../../app/lib/session-title";
 import { useControlAction, type OpenworkControlAction } from "../../../shell/control/control-provider";
 import { useSessionManagementStore } from "../sidebar/session-management-store";
-import { useWorkbenchStore } from "../chat/workbench-store";
+import { isSameWorkbenchSession, useWorkbenchStore } from "../chat/workbench-store";
 
 type SessionLike = {
   id?: string;
@@ -19,7 +21,7 @@ type SessionLike = {
 };
 
 type SessionControlWorkspace = OpenworkWorkspaceInfo & {
-  displayNameResolved?: string;
+  displayNameResolved: string;
 };
 
 type UseSessionControlActionsInput = {
@@ -31,9 +33,10 @@ type UseSessionControlActionsInput = {
   canCreateTask: boolean;
   openworkClient: OpenworkServerClient | null;
   opencodeClient: ReturnType<typeof createClient> | null;
+  endpointForWorkspace: (workspace: SessionControlWorkspace | null | undefined) => ResolvedWorkspaceEndpoint | null;
   navigateToSession: (sessionId: string) => void;
   navigateToSessionRoot: () => void;
-  createTaskInWorkspace: (workspaceId: string) => Promise<unknown> | unknown;
+  createTaskInWorkspace: (workspaceId: string) => Promise<string | null> | string | null;
   openModelPicker: () => void;
   refreshRouteState: () => Promise<unknown> | unknown;
 };
@@ -69,6 +72,7 @@ export function useSessionControlActions(input: UseSessionControlActionsInput) {
   const {
     canCreateTask,
     createTaskInWorkspace,
+    endpointForWorkspace,
     navigateToSession,
     navigateToSessionRoot,
     openModelPicker,
@@ -89,9 +93,10 @@ export function useSessionControlActions(input: UseSessionControlActionsInput) {
     sideEffect: "mutation",
     disabled: !canCreateTask || !selectedWorkspaceId,
     execute: async () => {
-      if (!selectedWorkspaceId) return false;
-      await createTaskInWorkspace(selectedWorkspaceId);
-      return true;
+      if (!selectedWorkspaceId) throw new Error("Cannot create a task without a selected workspace.");
+      const sessionId = await createTaskInWorkspace(selectedWorkspaceId);
+      if (sessionId === null) throw new Error("Task creation did not return a session ID.");
+      return sessionId;
     },
   }), [canCreateTask, createTaskInWorkspace, selectedWorkspaceId]);
   useControlAction(createTaskControlAction);
@@ -134,12 +139,13 @@ export function useSessionControlActions(input: UseSessionControlActionsInput) {
       if (!sessionId) return { ok: false, error: "sessionId is required" };
       const targetWorkspace = findSessionWorkspace(workspaces, sessionsByWorkspaceId, sessionId);
       const workbench = useWorkbenchStore.getState();
-      if (targetWorkspace?.id === workbench.workspaceId) {
-        if (sessionId === workbench.primarySessionId) {
+      if (targetWorkspace) {
+        const target = { workspaceId: targetWorkspace.id, sessionId };
+        if (isSameWorkbenchSession(target, workbench.primary)) {
           workbench.focusPane("primary");
           return { ok: true, sessionId, reused: "primary-pane" };
         }
-        if (sessionId === workbench.splitSessionId) {
+        if (isSameWorkbenchSession(target, workbench.secondary)) {
           workbench.focusPane("secondary");
           return { ok: true, sessionId, reused: "secondary-pane" };
         }
@@ -148,7 +154,10 @@ export function useSessionControlActions(input: UseSessionControlActionsInput) {
       return {
         ok: true,
         sessionId,
-        reused: workbench.tabs.some((tab) => tab.sessionId === sessionId) ? "tab" : "new-tab",
+        reused: targetWorkspace && workbench.tabs.some((tab) => isSameWorkbenchSession(tab, {
+          workspaceId: targetWorkspace.id,
+          sessionId,
+        })) ? "tab" : "new-tab",
       };
     },
   }), [navigateToSession, sessionsByWorkspaceId, workspaces]);
@@ -205,14 +214,16 @@ export function useSessionControlActions(input: UseSessionControlActionsInput) {
 
       const targetWorkspace = findSessionWorkspace(workspaces, sessionsByWorkspaceId, sessionId);
       if (!targetWorkspace) return { ok: false, error: "Session was not found in the current session list" };
-      await openworkClient.deleteSession(targetWorkspace.id, sessionId);
+      const endpoint = endpointForWorkspace(targetWorkspace);
+      if (!endpoint) return { ok: false, error: "Workspace runtime is not connected" };
+      await deleteNativeSession(endpoint, sessionId);
       if (selectedSessionId === sessionId) {
         navigateToSessionRoot();
       }
       await refreshRouteState();
       return { ok: true, sessionId, deleted: true };
     },
-  }), [navigateToSessionRoot, openworkClient, refreshRouteState, selectedSessionId, sessionsByWorkspaceId, workspaces]);
+  }), [endpointForWorkspace, navigateToSessionRoot, openworkClient, refreshRouteState, selectedSessionId, sessionsByWorkspaceId, workspaces]);
   useControlAction(deleteSessionControlAction);
 
   const modelPickerControlAction = useMemo<OpenworkControlAction>(() => ({

@@ -5,7 +5,9 @@
 
 import type { Session } from "@opencode-ai/sdk/v2/client";
 
+import { createClient, unwrap } from "@/app/lib/opencode";
 import type { OpenworkWorkspaceInfo } from "@/app/lib/openwork-server";
+import type { ResolvedWorkspaceEndpoint } from "@/app/lib/workspace-endpoint";
 import type { WorkspaceInfo } from "@/app/lib/desktop-types";
 import type { WorkspaceSessionGroup } from "@/app/types";
 import {
@@ -20,8 +22,7 @@ export type RouteWorkspace = OpenworkWorkspaceInfo & {
 };
 
 /**
- * Sessions as the routes handle them: SDK sessions from
- * openwork-server's listSessions, optionally enriched with run-status
+ * Sessions as the routes handle them: native SDK sessions, optionally enriched with run-status
  * fields that the sidebar probes defensively via getSessionStatus.
  */
 export type RouteSession = Session & {
@@ -30,6 +31,40 @@ export type RouteSession = Session & {
   runStatus?: unknown;
   slug?: string | null;
 };
+
+type RouteSessionListResult =
+  | { data: RouteSession[]; error?: undefined; request: Request; response: Response }
+  | { data?: undefined; error: unknown; request: Request; response: Response };
+type RouteSessionListTransport = (input: {
+  endpoint: ResolvedWorkspaceEndpoint;
+  limit: number;
+}) => Promise<RouteSessionListResult>;
+
+const nativeRouteSessionList: RouteSessionListTransport = async ({ endpoint, limit }) => {
+  const client = createClient(endpoint.opencodeBaseUrl, undefined, {
+    mode: "openwork",
+    token: endpoint.token,
+  });
+  return client.session.list({ limit });
+};
+
+export async function listRouteSessions(
+  endpoint: ResolvedWorkspaceEndpoint,
+  transport: RouteSessionListTransport = nativeRouteSessionList,
+): Promise<RouteSession[]> {
+  const result = await transport({ endpoint, limit: 200 });
+  try {
+    return unwrap(result);
+  } catch (error) {
+    if (error instanceof Error) {
+      Object.assign(error, { status: result.response.status });
+      if (result.error && typeof result.error === "object" && "code" in result.error && typeof result.error.code === "string") {
+        Object.assign(error, { code: result.error.code });
+      }
+    }
+    throw error;
+  }
+}
 
 export function mapDesktopWorkspace(workspace: WorkspaceInfo): RouteWorkspace {
   return {
@@ -102,10 +137,46 @@ export function classifyRouteSessionReadError(error: unknown): "not-found" | "re
     ? error.code
     : "";
   if (code === "session_not_found") return "not-found";
-  if (status === 502 || status === 503 || status === 504 || isTransientStartupError(describeRouteError(error))) {
+  if (
+    code === "opencode_unconfigured" ||
+    code === "opencode_engine_unreachable" ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    isTransientStartupError(describeRouteError(error))
+  ) {
     return "retryable";
   }
   return "error";
+}
+
+/**
+ * Runtime-backed session reads can briefly land between the desktop server
+ * accepting requests and the selected workspace engine becoming ready. Keep
+ * that startup gap inside a bounded retry instead of turning it into a route
+ * error. Terminal authorization and workspace errors still fail immediately.
+ */
+export async function readRouteSessionsWithRetry<T>(input: {
+  load: () => Promise<T>;
+  retryDelaysMs?: readonly number[];
+  wait?: (delayMs: number) => Promise<void>;
+}): Promise<T> {
+  const retryDelaysMs = input.retryDelaysMs ?? [];
+  const wait = input.wait ?? ((delayMs: number) => new Promise<void>((resolve) => {
+    window.setTimeout(resolve, delayMs);
+  }));
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await input.load();
+    } catch (error) {
+      const retryDelayMs = retryDelaysMs[attempt];
+      if (retryDelayMs === undefined || classifyRouteSessionReadError(error) !== "retryable") {
+        throw error;
+      }
+      await wait(retryDelayMs);
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -154,22 +225,38 @@ export async function refreshRouteWorkspaceListState(input: {
   desktopWorkspaces: RouteWorkspace[];
   previousWorkspaces: RouteWorkspace[];
   orderIds: string[];
+  /** Optional startup backoff. Route callers opt in when their local server
+   * can briefly accept connections before its workspace API is ready. */
+  retryDelaysMs?: readonly number[];
+  wait?: (delayMs: number) => Promise<void>;
 }): Promise<RouteWorkspaceListState> {
-  try {
-    return resolveRouteWorkspaceListState({
-      list: await input.load(),
-      desktopWorkspaces: input.desktopWorkspaces,
-      previousWorkspaces: input.previousWorkspaces,
-      orderIds: input.orderIds,
-    });
-  } catch (error) {
-    const state = resolveRouteWorkspaceListState({
-      list: null,
-      desktopWorkspaces: input.desktopWorkspaces,
-      previousWorkspaces: input.previousWorkspaces,
-      orderIds: input.orderIds,
-    });
-    return { ...state, error };
+  const retryDelaysMs = input.retryDelaysMs ?? [];
+  const wait = input.wait ?? ((delayMs: number) => new Promise<void>((resolve) => {
+    window.setTimeout(resolve, delayMs);
+  }));
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return resolveRouteWorkspaceListState({
+        list: await input.load(),
+        desktopWorkspaces: input.desktopWorkspaces,
+        previousWorkspaces: input.previousWorkspaces,
+        orderIds: input.orderIds,
+      });
+    } catch (error) {
+      const retryDelayMs = retryDelaysMs[attempt];
+      if (retryDelayMs !== undefined && isTransientStartupError(describeRouteError(error))) {
+        await wait(retryDelayMs);
+        continue;
+      }
+      const state = resolveRouteWorkspaceListState({
+        list: null,
+        desktopWorkspaces: input.desktopWorkspaces,
+        previousWorkspaces: input.previousWorkspaces,
+        orderIds: input.orderIds,
+      });
+      return { ...state, error };
+    }
   }
 }
 
@@ -270,6 +357,39 @@ export function orderRouteWorkspaces(workspaces: RouteWorkspace[], orderIds: str
   }
 
   return ordered;
+}
+
+/**
+ * Capture the first visible workspace order and extend it without letting the
+ * server's active-workspace-first list reshuffle existing sidebar entries.
+ * IDs that are temporarily absent stay in the preference so a transient
+ * discovery gap cannot move them when they return.
+ */
+export function stabilizeRouteWorkspaceOrder(
+  workspaces: RouteWorkspace[],
+  orderIds: string[],
+): { orderIds: string[]; workspaces: RouteWorkspace[] } {
+  const stableOrderIds: string[] = [];
+  const seenIds = new Set<string>();
+
+  for (const value of orderIds) {
+    const id = value.trim();
+    if (!id || seenIds.has(id)) continue;
+    stableOrderIds.push(id);
+    seenIds.add(id);
+  }
+
+  for (const workspace of workspaces) {
+    const id = workspace.id.trim();
+    if (!id || seenIds.has(id)) continue;
+    stableOrderIds.push(id);
+    seenIds.add(id);
+  }
+
+  return {
+    orderIds: stableOrderIds,
+    workspaces: orderRouteWorkspaces(workspaces, stableOrderIds),
+  };
 }
 
 export function toSessionGroups(

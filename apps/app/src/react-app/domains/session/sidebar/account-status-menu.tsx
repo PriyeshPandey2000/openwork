@@ -1,7 +1,10 @@
 /** @jsxImportSource react */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowUpRight,
   BookOpen,
+  ChevronDown,
+  ChevronUp,
   LogOut,
   MessageCircleMore,
   MoreHorizontal,
@@ -10,7 +13,7 @@ import {
   Stethoscope,
   UserRound,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 import {
   DropdownMenu,
@@ -19,10 +22,12 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { t } from "@/i18n";
 import { usePlatform } from "../../../kernel/platform";
-import { useDenAuth } from "../../cloud/den-auth-provider";
+import { isDenSessionRestoring, useDenAuth } from "../../cloud/den-auth-provider";
 import { useControlAction, type OpenworkControlAction } from "../../../shell/control/control-provider";
 import { useShellConfig } from "../../../shell/shell-config";
 import type { OpenworkServerStatus } from "../../../../app/lib/openwork-server";
@@ -33,6 +38,9 @@ import {
   readDenBootstrapConfig,
   readDenSettings,
 } from "../../../../app/lib/den";
+import { markDesktopSignInInitiated } from "../../../../app/lib/den-sign-in-intent";
+import { exchangeHandoffAndSignIn } from "../../../../app/lib/den-handoff";
+import { parseManualAuthInput } from "../../../../app/lib/manual-auth-input";
 import {
   openWorkConnectAttentionTitle,
   resolveOpenWorkConnectStatus,
@@ -82,13 +90,12 @@ type RuntimeStatus = {
 type RuntimeStatusInput = {
   clientConnected: boolean;
   openworkServerStatus: OpenworkServerStatus;
-  loading?: boolean;
   initializing: boolean;
   reloadBusy?: boolean;
   reloadError?: string | null;
 };
 
-function resolveRuntimeStatus(input: RuntimeStatusInput): RuntimeStatus {
+export function resolveRuntimeStatus(input: RuntimeStatusInput): RuntimeStatus {
   if (input.reloadBusy) {
     return {
       variant: "loading",
@@ -99,7 +106,10 @@ function resolveRuntimeStatus(input: RuntimeStatusInput): RuntimeStatus {
   if (input.reloadError) {
     return { variant: "disconnected", label: t("system.reload_failed"), detail: input.reloadError };
   }
-  if (input.loading || (input.openworkServerStatus === "disconnected" && input.initializing)) {
+  // This row renders app-scoped facts only. Per-session loading (messages
+  // still fetching, a model verdict still pending) stays in the pane and the
+  // composer — one session's state must not paint the whole app as booting.
+  if (input.openworkServerStatus === "disconnected" && input.initializing) {
     return {
       variant: "loading",
       label: t("session.preparing_workspace"),
@@ -183,7 +193,6 @@ export type AccountStatusMenuProps = {
   showConnectionStatus: boolean;
   providerConnectedIds: string[];
   mcpConnectedCount: number;
-  loading?: boolean;
   reloadBusy?: boolean;
   reloadError?: string | null;
   openWorkConnectState?: SessionCloudMcpMaintenanceState;
@@ -202,6 +211,10 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
   const navigate = useNavigate();
   const { config: shellConfig } = useShellConfig();
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const [pasteCode, setPasteCode] = useState("");
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [manualAuthOpen, setManualAuthOpen] = useState(false);
   const [initializing, setInitializing] = useState(
     () => Date.now() - BOOT_STARTED_AT < INITIALIZING_MS,
   );
@@ -256,8 +269,14 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
 
   const user = denAuth.user;
   const signedIn = denAuth.isSignedIn && user !== null;
-  // A retained session still restores in the background; never flash "Sign in".
-  const restoringSession = denAuth.status === "checking";
+  // A retained session still restores in the background; never flash "Sign
+  // in". This covers both the initial check and a retained session whose
+  // first check failed transiently (local server restart, control-plane
+  // blip) and is being retried.
+  const restoringSession = isDenSessionRestoring({
+    status: denAuth.status,
+    hasUser: user !== null,
+  });
   const accountLabel = signedIn
     ? user.name?.trim() || user.email
     : restoringSession ? "OpenWork Cloud" : "Sign in";
@@ -269,7 +288,6 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
     ? resolveRuntimeStatus({
       clientConnected: props.clientConnected,
       openworkServerStatus: props.openworkServerStatus,
-      loading: props.loading,
       initializing,
       reloadBusy: props.reloadBusy,
       reloadError: props.reloadError,
@@ -285,13 +303,41 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
   const showStatus = shellConfig.statusBar && (runtimeStatus !== null || connectStatus !== null);
 
   const openSignIn = () => {
+    markDesktopSignInInitiated();
     platform.openLink(buildDenAuthUrl(readDenBootstrapConfig().baseUrl, "sign-up"));
+  };
+
+  const submitPastedCode = async () => {
+    const parsed = parseManualAuthInput(pasteCode);
+    if (!parsed) {
+      setPasteError(t("den.error_paste_valid_code"));
+      return;
+    }
+    setPasteBusy(true);
+    setPasteError(null);
+    markDesktopSignInInitiated();
+    const nextBaseUrl = parsed.baseUrl ?? readDenSettings().baseUrl;
+    const result = await exchangeHandoffAndSignIn(parsed.grant, {
+      baseUrl: nextBaseUrl,
+      desktopInitiated: true,
+      fallbackErrorMessage: t("den.error_no_token"),
+    });
+    setPasteBusy(false);
+    if (!result.ok) {
+      setPasteError(result.error);
+      return;
+    }
+    setPasteCode("");
+    void denAuth.refresh();
   };
 
   const logOut = () => {
     const settings = readDenSettings();
     if (settings.authToken) {
-      void createDenClient({ baseUrl: settings.baseUrl, token: settings.authToken })
+      void createDenClient({
+        baseUrl: settings.baseUrl,
+        token: settings.authToken,
+      })
         .signOut()
         .catch(() => undefined);
     }
@@ -310,7 +356,7 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
             data-runtime-state={runtimeStatus?.variant}
             data-connect-state={connectStatus?.state}
             /* ps-1.5 puts the 24px avatar 12px from the edge, so the name lands on the sidebar label lane. */
-            className="flex w-full items-center gap-2 rounded-lg ps-1.5 pe-2 py-1.5 text-left transition-colors hover:bg-sidebar-accent"
+            className="flex w-full items-center gap-2 rounded-lg ps-1.5 pe-2 py-1.5 text-left transition-colors hover:bg-sidebar-accent max-lg:min-h-11"
             aria-label={signedIn ? `${user.email} — account and status` : "Account and status"}
             title={connectNeedsAttention
               ? openWorkConnectAttentionTitle(connectStatus.description)
@@ -420,7 +466,10 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
           <DropdownMenuItem
             onClick={() => {
               hideOpenWorkModelsPromo();
-              if (!denAuth.isSignedIn) navigate("/settings/cloud-account");
+              if (!denAuth.isSignedIn) {
+                navigate("/settings/cloud-account");
+                markDesktopSignInInitiated();
+              }
               platform.openLink(getOpenWorkModelsActionUrl(denAuth.isSignedIn));
             }}
           >
@@ -457,10 +506,76 @@ export function AccountStatusMenu(props: AccountStatusMenuProps) {
             Log out
           </DropdownMenuItem>
         ) : restoringSession ? null : (
-          <DropdownMenuItem onClick={openSignIn}>
-            <UserRound className="size-3.5" />
-            Sign in
-          </DropdownMenuItem>
+          <div
+            className="flex flex-col gap-2 px-2 py-2"
+            onPointerDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <Button
+              type="button"
+              className="h-11 w-full justify-between px-3 text-sm"
+              onClick={openSignIn}
+              data-testid="account-cloud-signin-button"
+            >
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <UserRound className="size-3.5" />
+                <span className="truncate">Sign in to OpenWork Cloud</span>
+              </span>
+              <ArrowUpRight className="size-3.5" />
+            </Button>
+
+            <button
+              type="button"
+              className="flex h-8 w-full items-center justify-between rounded-xl px-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+              onClick={() => setManualAuthOpen((open) => !open)}
+              aria-expanded={manualAuthOpen}
+              aria-controls="account-manual-auth-panel"
+            >
+              <span>
+                {manualAuthOpen ? t("den.hide_signin_code") : t("den.paste_signin_code")}
+              </span>
+              {manualAuthOpen ? (
+                <ChevronUp className="size-3.5" />
+              ) : (
+                <ChevronDown className="size-3.5" />
+              )}
+            </button>
+
+            {manualAuthOpen ? (
+              <div id="account-manual-auth-panel" className="flex flex-col gap-2">
+                <label htmlFor="account-paste-signin-code" className="text-[11px] text-muted-foreground">
+                  {t("den.signin_link_label")}
+                </label>
+                <Input
+                  id="account-paste-signin-code"
+                  value={pasteCode}
+                  onChange={(event) => {
+                    setPasteCode(event.currentTarget.value);
+                    if (pasteError) setPasteError(null);
+                  }}
+                  placeholder={t("den.signin_link_placeholder")}
+                  className="h-11 text-base lg:h-9 lg:text-sm"
+                  disabled={pasteBusy}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  className="h-11 max-lg:h-11"
+                  disabled={pasteBusy || !pasteCode.trim()}
+                  onClick={() => void submitPastedCode()}
+                >
+                  {pasteBusy ? t("den.finishing") : t("den.finish_signin")}
+                </Button>
+                {pasteError ? (
+                  <p className="text-[11px] text-destructive">{pasteError}</p>
+                ) : (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    {t("den.signin_link_hint")}
+                  </p>
+                )}
+              </div>
+            ) : null}
+          </div>
         )}
       </DropdownMenuContent>
     </DropdownMenu>

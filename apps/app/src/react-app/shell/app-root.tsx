@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 
-import { useEffect, useMemo, useSyncExternalStore, type ReactNode } from "react";
-import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router";
 
 import { captureAnalyticsEvent, initAnalytics } from "../../app/lib/analytics";
 import {
@@ -25,10 +25,12 @@ import {
 } from "../domains/connections/cloud-inventory-cache";
 import { ForcedSigninPage } from "../domains/cloud/forced-signin-page";
 import { EnterpriseActivationGate } from "../domains/cloud/enterprise-activation-gate";
+import { OpenWorkWebAccessGate } from "../domains/cloud/openwork-web-access-gate";
 import { OrgOnboardingPage } from "../domains/cloud/org-onboarding-page";
 import { NewProvidersListener } from "./new-providers-listener";
 import { useDesktopFontZoomBehavior } from "./font-zoom";
 import { LoadingOverlay } from "./loading-overlay";
+import { useVisualViewportInset } from "../../hooks/use-visual-viewport-inset";
 import { DevProfiler, DevProfilerOverlay } from "./dev-profiler";
 import { ReactRenderWatchdogOverlay } from "./react-render-watchdog-overlay";
 import { CloudWorkspaceOverlay, CloudWorkspaceStatusProvider } from "./cloud-workspace-overlay";
@@ -44,6 +46,8 @@ import { SessionRoute } from "./session-route";
 import { SettingsRoute } from "./settings-route";
 import { ShellConfigProvider } from "./shell-config";
 import { WelcomeRoute } from "./welcome-route";
+import { readOrgSelectionPending } from "../../app/lib/den-sign-in-intent";
+import { signedInRoute } from "./den-signin-routing";
 
 
 type DenSigninGateProps = {
@@ -75,6 +79,8 @@ function DenSigninGate({ children }: DenSigninGateProps) {
   const denAuth = useDenAuth();
   const location = useLocation();
   const navigate = useNavigate();
+  const locationRef = useRef(location);
+  locationRef.current = location;
   const bootstrap = useSyncExternalStore(
     subscribeToDenBootstrap,
     readDenBootstrapSnapshot,
@@ -102,12 +108,25 @@ function DenSigninGate({ children }: DenSigninGateProps) {
       if (!denAuth.isSignedIn && !onSignin) {
         navigate("/signin", { replace: true });
       } else if (denAuth.isSignedIn && onSignin) {
-        // Signed in — route to onboarding so the user sees their org resources.
-        navigate("/onboarding", { replace: true });
+        navigate(
+          signedInRoute(readDenSettings().activeOrgId, {
+            orgSelectionPending: readOrgSelectionPending().pending,
+          }),
+          { replace: true },
+        );
       }
     } else if (onSignin) {
       navigate("/session", { replace: true });
     } else if (!denAuth.isSignedIn && hasPreparedBootstrap && !onOnboarding) {
+      navigate("/onboarding", { replace: true });
+    } else if (
+      denAuth.isSignedIn &&
+      !onOnboarding &&
+      readOrgSelectionPending().pending
+    ) {
+      // A desktop-initiated sign-in is still waiting for the user's explicit
+      // organization choice (including after an app relaunch mid-flow); the
+      // onboarding step owns resolving it.
       navigate("/onboarding", { replace: true });
     }
 
@@ -126,22 +145,34 @@ function DenSigninGate({ children }: DenSigninGateProps) {
     requireSignin,
   ]);
 
-  // After a fresh sign-in, navigate to the onboarding page so the user sees
-  // their signed-in org state. Do not wait for an active org: first-run users
-  // may not belong to one yet, and must not remain on the signed-out welcome.
+  // After a fresh sign-in, returning members go straight to chat. Give org
+  // restoration a brief chance to settle before treating the user as new.
   useEffect(() => {
     const handler = (event: WindowEventMap[typeof denSessionUpdatedEvent]) => {
       if (event.detail?.status !== "success") return;
+      const signInLocation = locationRef.current;
       let attempts = 0;
       const check = () => {
+        const currentLocation = locationRef.current;
+        if (
+          currentLocation.pathname !== signInLocation.pathname
+          || currentLocation.search !== signInLocation.search
+          || currentLocation.hash !== signInLocation.hash
+        ) return;
         attempts++;
         const settings = readDenSettings();
-        if (settings.authToken?.trim()) {
+        if (settings.authToken?.trim() && readOrgSelectionPending().pending) {
+          // Desktop-initiated sign-in: the org chooser decides — do not race
+          // it to /session while the choice is deliberately open.
           navigate("/onboarding", { replace: true });
+        } else if (settings.authToken?.trim() && settings.activeOrgId?.trim()) {
+          navigate("/session", { replace: true });
         } else if (attempts < 10) {
           // Session persistence should already be done, but retry briefly in
           // case another consumer is still applying the handoff result.
           setTimeout(check, 500);
+        } else if (settings.authToken?.trim()) {
+          navigate(signedInRoute(settings.activeOrgId), { replace: true });
         }
       };
       // First check after a short delay for the auth to settle
@@ -152,7 +183,7 @@ function DenSigninGate({ children }: DenSigninGateProps) {
   }, [navigate]);
 
   if (requireSignin && denAuth.status === "checking") {
-    return <ForcedSigninPage developerMode={false} />;
+    return null;
   }
 
   if (redirectingPreparedWorkspace) return <Navigate to="/onboarding" replace />;
@@ -212,6 +243,9 @@ function DenAuthControlActions() {
       const result = await exchangeHandoffAndSignIn(grant.trim(), {
         baseUrl: targetBaseUrl,
         client,
+        // Automation surface: commit the exchange-reported org directly; a
+        // UI chooser would strand a headless driver.
+        desktopInitiated: false,
         fallbackErrorMessage: "No token returned",
       });
       if (!result.ok) return { ok: false, error: result.error };
@@ -319,6 +353,7 @@ let appOpenedCaptured = false;
 
 export function AppRoot() {
   useDesktopFontZoomBehavior();
+  useVisualViewportInset();
 
   // Module-level dedupe keeps StrictMode double-mounts from double-counting.
   useEffect(() => {
@@ -351,10 +386,11 @@ export function AppRoot() {
           <OpenworkContextPublisher />
           <DenAuthControlActions />
           <BrandThemeControlActions />
-          <CloudWorkspaceStatusProvider>
           <EnterpriseActivationGate>
-          <DenSigninGate>
-            <Routes>
+            <DenSigninGate>
+              <OpenWorkWebAccessGate>
+                <CloudWorkspaceStatusProvider>
+                  <Routes>
               <Route
                 path="/signin"
                 element={
@@ -413,6 +449,22 @@ export function AppRoot() {
                 }
               />
               <Route
+                path="/automations"
+                element={
+                  <DevProfiler id="AutomationsRoute">
+                    <SessionRoute />
+                  </DevProfiler>
+                }
+              />
+              <Route
+                path="/dashboard"
+                element={
+                  <DevProfiler id="DashboardRoute">
+                    <SessionRoute />
+                  </DevProfiler>
+                }
+              />
+              <Route
                 path="/workspace/:workspaceId/extensions/*"
                 element={
                   <DevProfiler id="SessionRoute">
@@ -448,12 +500,13 @@ export function AppRoot() {
                   settings deliberately via the sidebar or command palette. */}
               <Route path="/" element={<Navigate to="/session" replace />} />
               <Route path="*" element={<Navigate to="/session" replace />} />
-            </Routes>
-          </DenSigninGate>
-          <LoadingOverlay />
+                  </Routes>
+                  <LoadingOverlay />
+                  <CloudWorkspaceOverlay />
+                </CloudWorkspaceStatusProvider>
+              </OpenWorkWebAccessGate>
+            </DenSigninGate>
           </EnterpriseActivationGate>
-          <CloudWorkspaceOverlay />
-          </CloudWorkspaceStatusProvider>
         </OpenworkControlProvider>
         </AppMenuProvider>
         </ShellConfigProvider>
